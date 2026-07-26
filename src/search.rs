@@ -135,9 +135,12 @@ pub fn rg_search(root: &Path, query: &str) -> Vec<SearchResultItem> {
 pub fn rg_cmd(root: &Path, query: &str, exclude_globs: &[String]) -> Command {
     let decoded = decode_escapes(query);
     let mut cmd = Command::new("rg");
+    // 内容搜索要求精准匹配：--fixed-strings 字面量匹配（不拆词、不当正则），
+    // 且不加 --smart-case / -i，保持大小写敏感，避免小写查询误命中大写内容
+    // （如 ceshi 误匹配 SPACESHIP）。
     cmd.arg("--count-matches")
         .arg("--fixed-strings")
-        .arg("--smart-case")
+        .arg("--case-sensitive")
         .arg("--color=never")
         .arg("--line-buffered");
     if decoded.contains('\n') {
@@ -553,6 +556,26 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].matches, 2);
         assert!(items[0].display.ends_with("a.txt"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rg_search_is_exact_case_sensitive() {
+        let dir = make_temp_dir("rgexact");
+        // 大写内容中包含小写查询的子串（如 SPACESHIP 含 CESHI）：
+        // 精准匹配要求大小写敏感，小写查询 ceshi 不应命中
+        fs::write(dir.join("a.txt"), "ZEND_SPACESHIP_SPEC\n").unwrap();
+        fs::write(dir.join("b.txt"), "this has ceshi inside\n").unwrap();
+
+        let items = rg_search(&dir, "ceshi");
+        assert_eq!(items.len(), 1, "got {items:?}");
+        assert!(items[0].display.ends_with("b.txt"), "got {items:?}");
+
+        // 不拆词：ceshi 不应匹配被其他字符隔开的 c.e.s.h.i
+        fs::write(dir.join("c.txt"), "c e s h i\n").unwrap();
+        let items = rg_search(&dir, "ceshi");
+        assert_eq!(items.len(), 1, "got {items:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -9,6 +9,8 @@
 //! │ 快捷键提示                                   │
 //! ╰──────────────────────────────────────────────╯
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -162,14 +164,17 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     app.ensure_list_visible(height);
 
     if app.results.is_empty() {
-        let msg = if app.searching {
-            "搜索中…"
-        } else if app.last_query.is_empty() {
-            "暂无结果"
+        let lines = if app.searching {
+            loading_lines("搜索中", inner.height)
         } else {
-            "无匹配结果"
+            let msg = if app.last_query.is_empty() {
+                "暂无结果"
+            } else {
+                "无匹配结果"
+            };
+            placeholder_lines(msg, inner.height)
         };
-        f.render_widget(Paragraph::new(placeholder_lines(msg, inner.height)), inner);
+        f.render_widget(Paragraph::new(lines), inner);
         return;
     }
 
@@ -230,6 +235,7 @@ fn list_title_right(app: &App) -> Option<Line<'static>> {
     let line = if app.searching {
         Line::from(vec![
             Span::styled(" 搜索中 ", Style::default().fg(theme::YELLOW)),
+            Span::styled(format!("{} ", spinner()), Style::default().fg(theme::YELLOW)),
             Span::styled(format!("{count} 项 "), theme::title_style()),
         ])
     } else {
@@ -248,6 +254,31 @@ fn placeholder_lines(msg: &str, height: u16) -> Vec<Line<'static>> {
     lines.push(
         Line::from(Span::styled(msg.to_string(), theme::placeholder()))
             .alignment(Alignment::Center),
+    );
+    lines
+}
+
+/// 动态加载标识：基于当前时间在 braille 帧间循环，形成旋转动画（非静止符号）。
+/// 主循环每轮都会重绘（无事件时约 60ms 一次），故动画能持续转动。
+fn spinner() -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    FRAMES[(ms / 80) as usize % FRAMES.len()]
+}
+
+/// 居中加载提示：文案 + 动态 spinner（取代旧的静态 “…” 省略号）。
+fn loading_lines(label: &str, height: u16) -> Vec<Line<'static>> {
+    let pad = usize::from(height / 2);
+    let mut lines = vec![Line::default(); pad];
+    lines.push(
+        Line::from(vec![
+            Span::styled(format!("{label} "), theme::placeholder()),
+            Span::styled(spinner().to_string(), Style::default().fg(theme::YELLOW)),
+        ])
+        .alignment(Alignment::Center),
     );
     lines
 }
@@ -313,20 +344,20 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
             .scroll((app.preview_scroll, 0));
         f.render_widget(paragraph, area);
     } else {
-        let msg = if app.preview_loading {
-            "加载中…"
-        } else if app.selected_item().is_some() {
-            "无法预览该文件"
-        } else if app.searching {
-            "搜索中…"
-        } else if !app.last_query.is_empty() {
-            "无匹配结果"
-        } else {
-            "暂无预览"
-        };
         f.render_widget(block, area);
         if inner.height > 0 && inner.width > 0 {
-            f.render_widget(Paragraph::new(placeholder_lines(msg, inner.height)), inner);
+            let lines = if app.preview_loading {
+                loading_lines("加载中", inner.height)
+            } else if app.selected_item().is_some() {
+                placeholder_lines("无法预览该文件", inner.height)
+            } else if app.searching {
+                loading_lines("搜索中", inner.height)
+            } else if !app.last_query.is_empty() {
+                placeholder_lines("无匹配结果", inner.height)
+            } else {
+                placeholder_lines("暂无预览", inner.height)
+            };
+            f.render_widget(Paragraph::new(lines), inner);
         }
     }
 }
