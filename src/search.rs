@@ -102,11 +102,11 @@ fn run_fd(root: &Path) -> Vec<String> {
 fn score_file(root_str: &str, path: &str, query_lower: &str) -> Option<SearchResultItem> {
     let name = Path::new(path).file_name()?.to_str()?.to_lowercase();
     let score = fuzzy_score(query_lower, &name)?;
-    let display = path
-        .strip_prefix(root_str)
-        .map(|s| s.trim_start_matches('/'))
-        .unwrap_or(path)
-        .to_string();
+    let display = sanitize_display(
+        path.strip_prefix(root_str)
+            .map(|s| s.trim_start_matches('/'))
+            .unwrap_or(path),
+    );
     Some(SearchResultItem {
         path: PathBuf::from(path),
         display,
@@ -166,10 +166,21 @@ pub fn parse_count_line(root: &Path, line: &str) -> Option<SearchResultItem> {
     }
     Some(SearchResultItem {
         path: root.join(rel),
-        display: rel.to_string(),
+        display: sanitize_display(rel),
         matches,
         score: matches as i64,
     })
+}
+
+/// 展示用文本清洗：文件/路径名中的控制字符（ESC/BEL/换行等）替换为 �，
+/// 避免终端把它当作转义序列执行，造成花屏、内容画出界面框外。
+pub fn sanitize_display(s: &str) -> String {
+    if !s.chars().any(|c| c.is_control()) {
+        return s.to_string();
+    }
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 /// 解析 stderr 中的权限错误：`rg: ./path: Permission denied (os error 13)`，
@@ -215,6 +226,7 @@ pub fn decode_escapes(q: &str) -> String {
 
 /// 粘贴文本编码为查询转义形式（与 decode_escapes 对应）：
 /// 换行/制表符 -> `\n` `\t`，反斜杠 -> `\\`；`\r\n` 与单独 `\r` 归一化为换行。
+/// 其余控制字符（ESC/BEL 等）直接丢弃，防止进入输入框后注入终端造成花屏。
 /// 这样粘贴多行原文进输入框后可直接命中 --multiline 搜索。
 pub fn encode_paste(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -231,6 +243,8 @@ pub fn encode_paste(raw: &str) -> String {
                 }
                 out.push_str("\\n");
             }
+            // 其余控制字符（ESC/BEL 等）丢弃，防止注入终端造成花屏
+            c if c.is_control() => {}
             c => out.push(c),
         }
     }
@@ -514,6 +528,22 @@ mod tests {
     }
 
     #[test]
+    fn fd_search_sanitizes_control_chars_in_names() {
+        let dir = make_temp_dir("fdctl");
+        // 文件名含 ESC（终端转义序列）：展示文本必须被清洗
+        fs::write(dir.join("ctrl_\u{1b}[31m_test.sh"), "echo hi").unwrap();
+
+        let (items, _) = fd_search(&dir, "test.sh", None);
+        assert_eq!(items.len(), 1, "got {items:?}");
+        assert!(!items[0].display.chars().any(|c| c.is_control()), "got {:?}", items[0].display);
+        assert!(items[0].display.contains('\u{FFFD}'));
+        // path 字段保留原始路径，保证打开文件正常
+        assert!(items[0].path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rg_search_finds_content() {
         let dir = make_temp_dir("rg");
         fs::write(dir.join("a.txt"), "hello world\nhello again\n").unwrap();
@@ -567,8 +597,19 @@ mod tests {
         assert_eq!(encode_paste("C:\\Users"), "C:\\\\Users");
         assert_eq!(encode_paste("plain"), "plain");
         assert_eq!(encode_paste(""), "");
+        // 其他控制字符（ESC/BEL/SO/SI…）直接丢弃
+        assert_eq!(encode_paste("a\u{7}b\u{1b}c\u{e}d"), "abcd");
         // 与 decode_escapes 互逆（CR 归一化为 \n 除外）
         assert_eq!(decode_escapes(&encode_paste("x\ny\\z\tw")), "x\ny\\z\tw");
+    }
+
+    #[test]
+    fn sanitize_display_replaces_control_chars() {
+        assert_eq!(sanitize_display("normal/file.txt"), "normal/file.txt");
+        // ESC 等控制字符替换为 �，且不影响真实路径（path 字段不动，仅清洗展示文本）
+        assert_eq!(sanitize_display("a\u{1b}[31mb.png"), "a�[31mb.png");
+        assert_eq!(sanitize_display("x\u{7}y\u{e}z"), "x�y�z");
+        assert_eq!(sanitize_display(""), "");
     }
 
     #[test]

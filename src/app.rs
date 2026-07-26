@@ -211,9 +211,14 @@ impl App {
         match key.code {
             KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
+            // 搜索进行中不切换模式：与 Enter 一样只弹提示框（3 秒后自动消失）
             KeyCode::Tab => {
-                self.mode.toggle();
-                self.trigger_search_now();
+                if self.searching {
+                    self.busy_popup_since = Some(Instant::now());
+                } else {
+                    self.mode.toggle();
+                    self.trigger_search_now();
+                }
             }
             KeyCode::Char('p') if ctrl => self.start_path_edit(),
             KeyCode::Char('j') if ctrl => self.scroll_preview(3),
@@ -273,8 +278,8 @@ impl App {
     /// 编码为查询转义形式后插入（多行文本 -> \n 序列，自动启用 --multiline）
     pub fn on_paste(&mut self, text: &str) {
         if self.editing_path {
-            // 路径输入框：单行，换行/回车无意义直接丢弃
-            let cleaned: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+            // 路径输入框：单行，换行/回车及其他控制字符（ESC 等）直接丢弃，防止花屏
+            let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
             let n = cleaned.chars().count();
             let byte = char_byte(&self.path_input, self.path_cursor);
             self.path_input.insert_str(byte, &cleaned);
@@ -826,6 +831,28 @@ mod tests {
         app.busy_popup_since = Some(Instant::now() - BUSY_POPUP_TTL - Duration::from_secs(1));
         app.tick();
         assert!(app.busy_popup_since.is_none());
+    }
+
+    /// 搜索进行中按 Tab：只弹提示框，不切换模式也不派发新搜索
+    #[test]
+    fn tab_while_searching_shows_busy_popup_without_toggling() {
+        let mut app = App::new();
+        app.input = "test".to_string();
+        app.searching = true;
+        let gen = app.search_gen;
+        let mode = app.mode;
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.busy_popup_since.is_some());
+        assert_eq!(app.search_gen, gen, "搜索中按 Tab 不应派发新搜索");
+        assert_eq!(app.mode, mode, "搜索中按 Tab 不应切换模式");
+
+        // 未搜索中时 Tab 正常切换模式并派发搜索
+        app.searching = false;
+        app.busy_popup_since = None;
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.busy_popup_since.is_none());
+        assert_ne!(app.mode, mode);
+        assert_eq!(app.search_gen, gen + 1);
     }
 
     /// 流式批次到达后结果重排序，选中项被“挤”到别的文件时预览必须跟着刷新，

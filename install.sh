@@ -231,4 +231,3 @@ check_path
 
 echo
 ok "安装完成！运行 ${C_BOLD}sift${C_RESET}${C_GREEN} 开始使用${C_RESET}"
-echo "  卸载: rm -f $PREFIX/sift"

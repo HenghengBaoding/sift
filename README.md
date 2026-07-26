@@ -13,10 +13,16 @@ git clone <repo-url> && cd sift
 
 常用选项：`--system`（装入 `/usr/local/bin`）、`--prefix DIR`、`--skip-deps`、`--help` 查看全部。
 
+更新到最新版本（拉取最新代码并重新编译安装，已是最新则跳过）：
+
+```bash
+./update.sh            # 在 sift 源码目录内运行；--system / --prefix 需与安装时一致
+```
+
 卸载：
 
 ```bash
-rm -f ~/.local/bin/sift
+./uninstall.sh         # 默认从 ~/.local/bin 移除；--system / --prefix 同上
 ```
 
 ## 依赖

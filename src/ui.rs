@@ -17,7 +17,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, MAX_RESULTS};
-use crate::search::{SearchMode, SearchResultItem};
+use crate::search::{sanitize_display, SearchMode, SearchResultItem};
 use crate::theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -39,10 +39,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_list(f, app, middle[0]);
 
-    // 路径框高度按折行数动态计算
+    // 路径框高度按折行数动态计算；文件名可能含控制字符，清洗后再展示/测量
     let full_path = app
         .selected_item()
-        .map(|i| i.path.display().to_string())
+        .map(|i| sanitize_display(&i.path.display().to_string()))
         .unwrap_or_default();
     let inner_w = middle[1].width.saturating_sub(2).max(1) as usize;
     let path_lines = wrap_lines(&full_path, inner_w).clamp(1, 6) as u16;
@@ -81,7 +81,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         + UnicodeWidthStr::width(" (Ctrl+P) ");
     // 路径按剩余宽度截断，保证不与右侧 chip 重叠
     let path_budget = titles_w.saturating_sub(fixed_w + chip_w + 1).max(4);
-    let path = truncate_width(&app.current_path_display(), path_budget);
+    let path = truncate_width(&sanitize_display(&app.current_path_display()), path_budget);
     let title = Line::from(vec![
         Span::styled(" 搜索 | 模式: ", theme::title_style()),
         Span::styled(
@@ -427,12 +427,12 @@ fn draw_path_popup(f: &mut Frame, app: &App) {
     f.set_cursor_position((x.min(max_x), popup.y + 1));
 }
 
-/// “搜索进行中”提示弹窗：搜索未结束时按 Enter 弹出，3 秒自动消失
+/// “搜索进行中”提示弹窗：搜索未结束时按 Enter / Tab 弹出，3 秒自动消失
 fn draw_busy_popup(f: &mut Frame) {
     let area = f.area();
     let lines = [
         "当前搜索还没执行完，先别急～",
-        "等它完成后再按 Enter 重新搜索",
+        "等它完成后再重新搜索或切换模式",
     ];
     let text_w = lines
         .iter()
@@ -573,7 +573,31 @@ mod tests {
         let s = render_to_string(&mut app, 100, 30);
         assert!(s.contains("搜索进行中"), "{s}");
         assert!(s.contains("先别急"), "{s}");
-        assert!(s.contains("Enter"), "{s}");
+        assert!(s.contains("切换模式"), "{s}");
+    }
+
+    /// 文件名含 ESC 等控制字符时，整个界面（列表/路径框）不得把控制字符写进终端
+    #[test]
+    fn control_chars_in_names_never_reach_screen() {
+        let mut app = App::new();
+        app.last_query = "test".to_string();
+        app.results = vec![SearchResultItem {
+            path: std::path::PathBuf::from("/tmp/ctrl_\u{1b}[31m_test.sh"),
+            display: sanitize_display("ctrl_\u{1b}[31m_test.sh"),
+            matches: 0,
+            score: 100,
+        }];
+        app.list_state.select(Some(0));
+
+        let s = render_to_string(&mut app, 100, 30);
+        assert!(s.contains('\u{FFFD}'), "{s}");
+        for c in s.chars() {
+            assert!(
+                !c.is_control() || c == '\n',
+                "control char U+{:04X} reached screen",
+                c as u32
+            );
+        }
     }
 
     #[test]

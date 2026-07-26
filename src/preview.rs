@@ -1,6 +1,7 @@
 //! 文件预览：调用 `bat` 输出带 ANSI 颜色的文本，再转成 ratatui 的 Text。
 //! 大文件只读取头部固定字节数经 stdin 交给 bat，保证渲染耗时有界。
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -19,7 +20,54 @@ const PREVIEW_MAX_BYTES: usize = 512 * 1024;
 /// 兜底读取时的最大字节数
 const FALLBACK_MAX_BYTES: usize = 256 * 1024;
 
+/// 常见图片扩展名：图片不支持预览，直接给出提示，
+/// 避免二进制内容经 bat / 兜底读取输出到终端造成花屏
+const IMAGE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "icns", "svg", "tif", "tiff",
+    "avif", "heic", "heif", "jxl", "psd", "raw", "cr2", "nef", "arw", "dng", "ppm",
+    "pgm", "pbm", "xpm", "exr", "hdr",
+];
+
 pub fn render(path: &Path, width: u16) -> Text<'static> {
+    // 图片不支持预览：直接提示（也省去读文件与拉起 bat 的开销）
+    if is_image(path) {
+        return Text::from(Line::from("（图片文件，暂不支持预览）"));
+    }
+    let mut text = render_text(path, width);
+    sanitize_control_chars(&mut text);
+    text
+}
+
+/// 按扩展名（大小写不敏感）判断是否图片文件
+fn is_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// 剔除输出文本中的终端控制字符：制表符展开为空格，其余（ESC/BEL/SO/SI/CR…）丢弃。
+/// 否则二进制内容里的转义序列会被终端直接执行，造成花屏、内容画出界面框外。
+fn sanitize_control_chars(text: &mut Text<'static>) {
+    for line in &mut text.lines {
+        for span in &mut line.spans {
+            if !span.content.chars().any(|c| c.is_control() && c != '\n') {
+                continue;
+            }
+            let mut cleaned = String::with_capacity(span.content.len());
+            for c in span.content.chars() {
+                match c {
+                    '\t' => cleaned.push_str("    "),
+                    '\n' => cleaned.push(c),
+                    c if c.is_control() => {}
+                    c => cleaned.push(c),
+                }
+            }
+            span.content = Cow::Owned(cleaned);
+        }
+    }
+}
+
+fn render_text(path: &Path, width: u16) -> Text<'static> {
     let (head, truncated) = read_head(path, PREVIEW_MAX_BYTES);
     // 前 8KB 内含有 NUL 字节则视为二进制文件
     if head[..head.len().min(8192)].contains(&0) {
@@ -187,6 +235,55 @@ mod tests {
             .join("\n");
         assert!(joined.contains("已截断"), "marker missing");
         assert!(elapsed.as_secs() < 5, "preview too slow: {elapsed:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_file_shows_hint() {
+        let dir = std::env::temp_dir().join(format!("sift-test-img-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 即使内容不含 NUL（能绕过二进制探测），图片扩展名也直接命中提示；
+        // 扩展名大小写不敏感
+        let file = dir.join("photo.PNG");
+        fs::write(&file, b"no nul bytes in this fake image").unwrap();
+
+        let text = render(&file, 80);
+        let joined: String = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert!(joined.contains("图片"), "got: {joined}");
+        assert!(!joined.contains("no nul bytes"), "got: {joined}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_chars_never_reach_output() {
+        let dir = std::env::temp_dir().join(format!("sift-test-ctl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("weird.dat");
+        // 无 NUL 的二进制：ESC 序列、BEL、SO/SI、CR、TAB 全混进去
+        let mut data: Vec<u8> = (1u8..=255).collect();
+        data.extend_from_slice(b"\x1b[31m\x0e\x0f\x07\x08\x0c\r\ttail");
+        fs::write(&file, &data).unwrap();
+
+        let text = render(&file, 60);
+        for line in &text.lines {
+            for span in &line.spans {
+                for c in span.content.chars() {
+                    assert!(
+                        !c.is_control() || c == '\n',
+                        "control char U+{:04X} leaked into preview",
+                        c as u32
+                    );
+                }
+            }
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
