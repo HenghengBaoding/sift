@@ -1,0 +1,204 @@
+//! 文件预览：调用 `bat` 输出带 ANSI 颜色的文本，再转成 ratatui 的 Text。
+//! 大文件只读取头部固定字节数经 stdin 交给 bat，保证渲染耗时有界。
+
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::thread;
+
+use ansi_to_tui::IntoText;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+
+/// 最多渲染的行数，防止超大文件拖慢界面
+const MAX_LINES: usize = 5000;
+/// 送给 bat 的最大字节数：大文件只预览头部，耗时有界
+const PREVIEW_MAX_BYTES: usize = 512 * 1024;
+/// 兜底读取时的最大字节数
+const FALLBACK_MAX_BYTES: usize = 256 * 1024;
+
+pub fn render(path: &Path, width: u16) -> Text<'static> {
+    let (head, truncated) = read_head(path, PREVIEW_MAX_BYTES);
+    // 前 8KB 内含有 NUL 字节则视为二进制文件
+    if head[..head.len().min(8192)].contains(&0) {
+        return Text::from(Line::from("（二进制文件，不提供预览）"));
+    }
+    if head.is_empty() {
+        // 读失败（权限/不存在）或空文件
+        return fallback_read(path);
+    }
+    match run_bat(&head, path, width) {
+        Some(bytes) if !bytes.is_empty() => {
+            let mut text = bytes.into_text().unwrap_or_else(|_| fallback_read(path));
+            if truncated {
+                text.lines.push(Line::from(Span::styled(
+                    "…… 文件过大，预览已截断 ……",
+                    Style::default().add_modifier(Modifier::ITALIC),
+                )));
+            }
+            text
+        }
+        _ => fallback_read(path),
+    }
+}
+
+/// 只读文件头部 max 字节；返回 (内容, 是否被截断)。截取点回退到 UTF-8 边界。
+fn read_head(path: &Path, max: usize) -> (Vec<u8>, bool) {
+    let Ok(f) = File::open(path) else {
+        return (Vec::new(), false);
+    };
+    let mut buf = Vec::new();
+    let n = match f.take(max as u64 + 1).read_to_end(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return (Vec::new(), false),
+    };
+    let truncated = n > max;
+    buf.truncate(max);
+    // 截取点可能落在多字节字符中间，回退到合法边界
+    if let Err(e) = std::str::from_utf8(&buf) {
+        buf.truncate(e.valid_up_to());
+    }
+    (buf, truncated)
+}
+
+/// 通过 stdin 把文件头部交给 bat（--file-name 保留语法高亮检测）
+fn run_bat(head: &[u8], path: &Path, width: u16) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("bat");
+    cmd.arg("--paging=never")
+        .arg("--color=always")
+        .arg("--style=numbers");
+    if bat_has_macchiato() {
+        cmd.arg("--theme=Catppuccin Macchiato");
+    }
+    let mut child = cmd
+        .arg("--wrap=character")
+        .arg("--terminal-width")
+        .arg(width.max(10).to_string())
+        .arg("--line-range")
+        .arg(format!(":{MAX_LINES}"))
+        .arg("--file-name")
+        .arg(path.as_os_str())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let data = head.to_vec();
+    // 单独线程写 stdin，避免管道积满互相等待
+    thread::spawn(move || {
+        let _ = stdin.write_all(&data);
+    });
+    let output = child.wait_with_output().ok()?;
+    Some(output.stdout)
+}
+
+/// bat 是否带有 Catppuccin Macchiato 主题（只检测一次）
+fn bat_has_macchiato() -> bool {
+    static HAS: OnceLock<bool> = OnceLock::new();
+    *HAS.get_or_init(|| {
+        Command::new("bat")
+            .arg("--list-themes")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("Catppuccin Macchiato"))
+            .unwrap_or(false)
+    })
+}
+
+/// bat 不可用/失败时的兜底：直接读取文本内容。
+fn fallback_read(path: &Path) -> Text<'static> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let bytes = &bytes[..bytes.len().min(FALLBACK_MAX_BYTES)];
+            let content = String::from_utf8_lossy(bytes);
+            Text::from(content.into_owned())
+        }
+        Err(e) => Text::from(Line::from(format!("无法读取文件: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn renders_file_with_bat_or_fallback() {
+        let dir = std::env::temp_dir().join(format!("frsearch-test-preview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("demo.txt");
+        fs::write(&file, "hello frsearch\nsecond line\n").unwrap();
+
+        let text = render(&file, 80);
+        let joined: String = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("hello frsearch"), "got: {joined}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_file_shows_hint() {
+        let dir = std::env::temp_dir().join(format!("frsearch-test-bin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("blob.bin");
+        fs::write(&file, b"PK\x00\x01binarystuff").unwrap();
+
+        let text = render(&file, 80);
+        let joined: String = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert!(joined.contains("二进制文件"), "got: {joined}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn huge_file_is_truncated() {
+        let dir = std::env::temp_dir().join(format!("frsearch-test-huge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("huge.log");
+        // 写入超过 PREVIEW_MAX_BYTES 的内容
+        let line = "0123456789abcdef\n";
+        let mut content = String::new();
+        while content.len() < PREVIEW_MAX_BYTES + 4096 {
+            content.push_str(line);
+        }
+        fs::write(&file, content).unwrap();
+
+        let start = std::time::Instant::now();
+        let text = render(&file, 80);
+        let elapsed = start.elapsed();
+        let joined: String = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("已截断"), "marker missing");
+        assert!(elapsed.as_secs() < 5, "preview too slow: {elapsed:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_file_does_not_panic() {
+        let text = render(Path::new("/nonexistent/path/xyz.txt"), 80);
+        let joined: String = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert!(!joined.is_empty());
+    }
+}

@@ -1,0 +1,11 @@
+[package]
+name = "frsearch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+ansi-to-tui = "7"
+unicode-width = "0.2"
+anyhow = "1"
