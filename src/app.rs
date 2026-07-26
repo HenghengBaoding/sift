@@ -82,6 +82,8 @@ pub struct App {
     pub path_input: String,
     /// 路径输入框光标（按字符计）
     pub path_cursor: usize,
+    /// 路径输入框全选状态（弹窗打开时旧路径整体选中，输入即替换）
+    pub path_select_all: bool,
     /// 路径校验失败的错误信息（展示在弹窗内，编辑时自动清除）
     pub path_error: Option<String>,
 
@@ -134,6 +136,7 @@ impl App {
             editing_path: false,
             path_input: String::new(),
             path_cursor: 0,
+            path_select_all: false,
             path_error: None,
             input: String::new(),
             cursor: 0,
@@ -281,9 +284,16 @@ impl App {
             // 路径输入框：单行，换行/回车及其他控制字符（ESC 等）直接丢弃，防止花屏
             let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
             let n = cleaned.chars().count();
-            let byte = char_byte(&self.path_input, self.path_cursor);
-            self.path_input.insert_str(byte, &cleaned);
-            self.path_cursor += n;
+            if self.path_select_all {
+                // 全选状态下粘贴 = 整体替换
+                self.path_input = cleaned;
+                self.path_cursor = n;
+                self.path_select_all = false;
+            } else {
+                let byte = char_byte(&self.path_input, self.path_cursor);
+                self.path_input.insert_str(byte, &cleaned);
+                self.path_cursor += n;
+            }
             self.path_error = None;
             return;
         }
@@ -299,10 +309,11 @@ impl App {
 
     // ------------------------------------------------------------ 路径编辑弹窗
 
-    /// 打开路径编辑弹窗（预填当前路径）
+    /// 打开路径编辑弹窗（预填当前路径并全选，方便直接输入替换）
     fn start_path_edit(&mut self) {
         self.path_input = self.current_path_display();
         self.path_cursor = self.path_input.chars().count();
+        self.path_select_all = true;
         self.path_error = None;
         self.editing_path = true;
     }
@@ -312,6 +323,36 @@ impl App {
         // 除 Enter（重新校验）外，任何按键都清除上一次的校验错误
         if key.code != KeyCode::Enter {
             self.path_error = None;
+        }
+        // 全选状态下，编辑类按键先作用于整个选区，移动类按键取消选区
+        if self.path_select_all {
+            match key.code {
+                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.path_input.clear();
+                    self.path_input.push(c);
+                    self.path_cursor = 1;
+                    self.path_select_all = false;
+                    return;
+                }
+                KeyCode::Backspace | KeyCode::Delete => {
+                    self.path_input.clear();
+                    self.path_cursor = 0;
+                    self.path_select_all = false;
+                    return;
+                }
+                KeyCode::Left | KeyCode::Home => {
+                    self.path_cursor = 0;
+                    self.path_select_all = false;
+                    return;
+                }
+                KeyCode::Right | KeyCode::End => {
+                    self.path_cursor = self.path_input.chars().count();
+                    self.path_select_all = false;
+                    return;
+                }
+                // 其余按键（Enter / Esc / Ctrl+U / Ctrl+W 等）：取消全选后走正常逻辑
+                _ => self.path_select_all = false,
+            }
         }
         match key.code {
             KeyCode::Esc => self.editing_path = false,
@@ -975,5 +1016,54 @@ mod tests {
         assert!(!app.editing_path, "合法目录应关闭弹窗");
         let expected = std::fs::canonicalize("/tmp").unwrap();
         assert_eq!(app.current_path(), &expected);
+    }
+
+    /// 打开路径弹窗时旧路径应处于全选状态：直接输入即整体替换
+    #[test]
+    fn path_popup_opens_with_select_all_and_typing_replaces() {
+        let mut app = App::new();
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.editing_path);
+        assert!(app.path_select_all, "打开弹窗时应全选旧路径");
+        assert_eq!(app.path_input, app.current_path_display());
+
+        // 直接输入一个字符：旧路径被整体替换
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.path_input, "/");
+        assert_eq!(app.path_cursor, 1);
+        assert!(!app.path_select_all);
+
+        // 选区已取消，后续输入为正常插入
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.path_input, "/t");
+    }
+
+    /// 全选状态下：Backspace/Delete 清空，移动键取消选区，粘贴整体替换
+    #[test]
+    fn path_select_all_editing_and_movement() {
+        let mut app = App::new();
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        let old_len = app.path_input.chars().count();
+
+        // 左移：取消选区，光标到开头，内容不变
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(!app.path_select_all);
+        assert_eq!(app.path_cursor, 0);
+        assert_eq!(app.path_input.chars().count(), old_len);
+
+        // 重新全选后 Backspace：清空
+        app.path_select_all = true;
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(app.path_input.is_empty());
+        assert_eq!(app.path_cursor, 0);
+        assert!(!app.path_select_all);
+
+        // 重新全选后粘贴：整体替换
+        app.path_input = "/old/path".to_string();
+        app.path_select_all = true;
+        app.on_paste("/new/path");
+        assert_eq!(app.path_input, "/new/path");
+        assert_eq!(app.path_cursor, "/new/path".chars().count());
+        assert!(!app.path_select_all);
     }
 }

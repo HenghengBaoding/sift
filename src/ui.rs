@@ -407,7 +407,13 @@ fn draw_path_popup(f: &mut Frame, app: &App) {
         ),
         Span::raw(" "),
     ]);
-    let mut lines = vec![Line::from(app.path_input.as_str())];
+    // 全选状态下整行高亮，提示用户输入即替换
+    let input_line = if app.path_select_all {
+        Line::from(Span::styled(app.path_input.as_str(), theme::selected()))
+    } else {
+        Line::from(app.path_input.as_str())
+    };
+    let mut lines = vec![input_line];
     if let Some(err) = &app.path_error {
         lines.push(Line::from(Span::styled(
             err.clone(),
