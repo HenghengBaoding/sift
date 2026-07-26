@@ -1,4 +1,4 @@
-//! frsearch — 基于 fd / rg / bat 的终端文件搜索工具（仅 Linux）。
+//! sift — 基于 fd / rg / bat 的终端文件搜索工具（仅 Linux）。
 
 mod app;
 mod editor;

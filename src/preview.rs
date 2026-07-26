@@ -125,11 +125,11 @@ mod tests {
 
     #[test]
     fn renders_file_with_bat_or_fallback() {
-        let dir = std::env::temp_dir().join(format!("frsearch-test-preview-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sift-test-preview-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("demo.txt");
-        fs::write(&file, "hello frsearch\nsecond line\n").unwrap();
+        fs::write(&file, "hello sift\nsecond line\n").unwrap();
 
         let text = render(&file, 80);
         let joined: String = text
@@ -138,14 +138,14 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("hello frsearch"), "got: {joined}");
+        assert!(joined.contains("hello sift"), "got: {joined}");
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn binary_file_shows_hint() {
-        let dir = std::env::temp_dir().join(format!("frsearch-test-bin-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sift-test-bin-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("blob.bin");
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn huge_file_is_truncated() {
-        let dir = std::env::temp_dir().join(format!("frsearch-test-huge-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sift-test-huge-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("huge.log");

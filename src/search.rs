@@ -474,7 +474,7 @@ mod tests {
 
     fn make_temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "frsearch-test-{}-{}",
+            "sift-test-{}-{}",
             tag,
             std::process::id()
         ));

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# frsearch 一键安装脚本（仅 Linux）
+# sift 一键安装脚本（仅 Linux）
 #
 # 用法：
 #   ./install.sh                 安装到 ~/.local/bin（默认，无需 root）
@@ -52,10 +52,10 @@ done
 
 # ---------------------------------------------------------------- 环境检查
 
-[ "$(uname -s)" = "Linux" ] || die "frsearch 仅支持 Linux（当前系统: $(uname -s)）"
+[ "$(uname -s)" = "Linux" ] || die "sift 仅支持 Linux（当前系统: $(uname -s)）"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$SCRIPT_DIR/Cargo.toml" ] || die "未找到 Cargo.toml，请在 frsearch 源码目录内运行本脚本"
+[ -f "$SCRIPT_DIR/Cargo.toml" ] || die "未找到 Cargo.toml，请在 sift 源码目录内运行本脚本"
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -157,7 +157,7 @@ ensure_rust() {
 # ---------------------------------------------------------------- 构建与安装
 
 build_and_install() {
-    info "编译 frsearch（release）..."
+    info "编译 sift（release）..."
     cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
     local sudo_prefix=""
@@ -167,14 +167,14 @@ build_and_install() {
     fi
 
     $sudo_prefix mkdir -p "$PREFIX"
-    $sudo_prefix install -m 0755 "$SCRIPT_DIR/target/release/frsearch" "$PREFIX/frsearch"
-    ok "已安装: $PREFIX/frsearch"
+    $sudo_prefix install -m 0755 "$SCRIPT_DIR/target/release/sift" "$PREFIX/sift"
+    ok "已安装: $PREFIX/sift"
 }
 
 # ---------------------------------------------------------------- bat 主题
 
 install_bat_theme() {
-    # frsearch 检测到 Catppuccin Macchiato 主题时才启用，装一下让预览配色统一
+    # sift 检测到 Catppuccin Macchiato 主题时才启用，装一下让预览配色统一
     local config_dir themes_dir
     config_dir="$(bat --config-dir 2>/dev/null)" || return 0
     themes_dir="$config_dir/themes"
@@ -212,7 +212,7 @@ check_path() {
 
 # ---------------------------------------------------------------- 主流程
 
-printf '%s%s frsearch 安装程序%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+printf '%s%s sift 安装程序%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
 
 if [ "$SKIP_DEPS" -eq 0 ]; then
     install_deps
@@ -230,5 +230,5 @@ fi
 check_path
 
 echo
-ok "安装完成！运行 ${C_BOLD}frsearch${C_RESET}${C_GREEN} 开始使用${C_RESET}"
-echo "  卸载: rm -f $PREFIX/frsearch"
+ok "安装完成！运行 ${C_BOLD}sift${C_RESET}${C_GREEN} 开始使用${C_RESET}"
+echo "  卸载: rm -f $PREFIX/sift"

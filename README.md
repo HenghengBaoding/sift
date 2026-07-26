@@ -1,4 +1,4 @@
-# frsearch
+# sift
 
 基于 `fd` / `rg` / `bat` 的终端文件搜索 TUI（仅 Linux）。
 
@@ -7,7 +7,7 @@
 一键安装（自动安装依赖、编译并装入 `~/.local/bin`）：
 
 ```bash
-git clone <repo-url> && cd frsearch
+git clone <repo-url> && cd sift
 ./install.sh
 ```
 
@@ -16,7 +16,7 @@ git clone <repo-url> && cd frsearch
 卸载：
 
 ```bash
-rm -f ~/.local/bin/frsearch
+rm -f ~/.local/bin/sift
 ```
 
 ## 依赖

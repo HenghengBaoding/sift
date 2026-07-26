@@ -919,7 +919,7 @@ mod tests {
         assert!(app.path_error.as_deref().unwrap().contains("路径不存在"));
 
         // 存在但不是目录
-        let file = std::env::temp_dir().join(format!("frsearch-test-{}", std::process::id()));
+        let file = std::env::temp_dir().join(format!("sift-test-{}", std::process::id()));
         std::fs::write(&file, "x").unwrap();
         app.path_input = file.to_string_lossy().to_string();
         app.path_error = None;
