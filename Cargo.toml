@@ -9,3 +9,5 @@ crossterm = "0.28"
 ansi-to-tui = "7"
 unicode-width = "0.2"
 anyhow = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.3"

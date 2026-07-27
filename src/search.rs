@@ -9,17 +9,34 @@
 //!
 //! 内容搜索（rg）：
 //!   - 查询支持 `\n` / `\t` / `\\` 转义，含换行时自动开启 --multiline
-//!   - rg 以 current_dir=搜索根 运行，输出相对路径；排除 glob 用 '/' 锚定到搜索根
-//!   - 搜索中出现的 Permission denied 路径可聚合为排除 glob，下次搜索直接跳过
+//!   - rg 以 current_dir=搜索根 运行，输出相对路径
+//!   - 固定忽略内置系统目录（/proc /sys … 与 .git），并支持用户额外忽略目录
+//!   - `--max-filesize` 跳过超大文件；二进制文件 rg 默认即跳过
 
-use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
 use std::sync::Arc;
 
 /// 单次搜索返回的最大结果数
 const MAX_RESULTS: usize = 400;
+
+/// 内置必忽略目录（绝对路径）。当搜索根包含它们时自动排除，
+/// 避免 rg/fd 直接扫 /proc /sys 等虚拟/庞大目录（见 AGENTS.md）。
+pub const MANDATORY_IGNORES: &[&str] = &[
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/tmp",
+    "/var/tmp",
+    "/var/cache",
+    "/mnt",
+    "/media",
+    "/var/lib",
+    "/snap",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SearchMode {
@@ -51,10 +68,80 @@ pub struct SearchResultItem {
     /// 内容模式下该文件的命中次数
     pub matches: u64,
     pub score: i64,
+    /// 路径优先级：0=优先（/home /etc /usr/local），2=延后（/usr /var），1=其他。
+    /// 作为 score 之后的次级排序键，让大范围搜索时常用目录结果先出现。
+    pub priority: u8,
+}
+
+/// 结果排序：分数降序 → 路径优先级升序 → 展示文本升序
+fn cmp_items(a: &SearchResultItem, b: &SearchResultItem) -> std::cmp::Ordering {
+    b.score
+        .cmp(&a.score)
+        .then_with(|| a.priority.cmp(&b.priority))
+        .then_with(|| a.display.cmp(&b.display))
+}
+
+/// 路径优先级（见 SearchResultItem::priority）
+pub fn path_priority(path: &Path) -> u8 {
+    const PREFERRED: &[&str] = &["/home", "/etc", "/usr/local"];
+    const DELAYED: &[&str] = &["/usr", "/var"];
+    let s = path.to_string_lossy();
+    let under = |p: &str| s.as_ref() == p || s.starts_with(&format!("{p}/"));
+    if PREFERRED.iter().any(|p| under(p)) {
+        0
+    } else if DELAYED.iter().any(|p| under(p)) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 计算搜索根 root 之下需要忽略的目录相对路径（内置 + 用户额外）。
+/// 仅返回真正位于 root 之下的目录；root 本身不会被排除。
+pub fn ignore_rels(root: &Path, extra: &[String]) -> Vec<String> {
+    let mut rels: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for abs in MANDATORY_IGNORES
+        .iter()
+        .map(|s| s.to_string())
+        .chain(extra.iter().cloned())
+    {
+        if let Ok(rel) = Path::new(&abs).strip_prefix(root) {
+            let r = rel.to_string_lossy().into_owned();
+            if !r.is_empty() && seen.insert(r.clone()) {
+                rels.push(r);
+            }
+        }
+    }
+    rels
+}
+
+/// rg 排除 glob：始终排除 .git（--hidden 会把 .git 纳入搜索），
+/// 再加上 root 之下的忽略目录（'/' 前缀锚定到搜索根）。
+pub fn rg_exclude_globs(root: &Path, extra: &[String]) -> Vec<String> {
+    let mut globs = vec!["!.git".to_string()];
+    for r in ignore_rels(root, extra) {
+        globs.push(format!("!/{r}"));
+    }
+    globs
+}
+
+/// fd 排除项：root 之下的忽略目录（'/' 前缀锚定到搜索根）。
+/// fd 默认即跳过隐藏目录与 .git，无需额外排除。
+///
+/// 与内容搜索（rg）一致：用户额外忽略目录（Ctrl+I）同样作用于文件名搜索，
+/// 故 App 调用时 extra 传用户忽略目录。
+pub fn fd_excludes(root: &Path, extra: &[String]) -> Vec<String> {
+    ignore_rels(root, extra)
+        .into_iter()
+        .map(|r| format!("/{r}"))
+        .collect()
 }
 
 /// 文件名搜索：返回 (结果, 新构建的文件列表缓存)。
 /// `cached` 为已有缓存时直接在内存中过滤，避免每次按键都拉起 fd。
+/// （App 内走流式 fd_search_job；此函数仅供测试/复用。）
+#[cfg(test)]
 pub fn fd_search(
     root: &Path,
     query: &str,
@@ -68,27 +155,45 @@ pub fn fd_search(
             (arc.clone(), Some(arc))
         }
     };
+    (filter_fd_list(root, query, &list), new_list)
+}
 
+/// 在已构建的文件列表上做内存过滤与打分（fd 流式读取完成后复用）
+pub fn filter_fd_list(root: &Path, query: &str, list: &[String]) -> Vec<SearchResultItem> {
     let root_str = root.to_string_lossy();
     let query_lower = query.to_lowercase();
     let mut items: Vec<SearchResultItem> = list
         .iter()
         .filter_map(|p| score_file(&root_str, p, &query_lower))
         .collect();
-    items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.display.cmp(&b.display)));
+    items.sort_by(cmp_items);
     items.truncate(MAX_RESULTS);
-    (items, new_list)
+    items
 }
 
-fn run_fd(root: &Path) -> Vec<String> {
-    let output = Command::new("fd")
-        .arg("--type")
+/// 构建 fd 命令：列出 root 下所有文件的绝对路径。
+///
+/// 与内容搜索（rg）保持一致：
+/// - `--exclude` 排除忽略目录（内置必忽略 + 用户额外）
+/// - `--size -<N>b` 跳过超过大小上限的文件（`-N` 表示 <= N 字节）
+pub fn fd_cmd(root: &Path, excludes: &[String], max_filesize_bytes: u64) -> Command {
+    let mut cmd = Command::new("fd");
+    cmd.arg("--type")
         .arg("f")
         .arg("--absolute-path")
         .arg("--color=never")
-        .arg(".")
-        .arg(root.as_os_str())
-        .output();
+        .arg("--size")
+        .arg(format!("-{max_filesize_bytes}b"));
+    for e in excludes {
+        cmd.arg("--exclude").arg(e);
+    }
+    cmd.arg(".").arg(root.as_os_str());
+    cmd
+}
+
+#[cfg(test)]
+fn run_fd(root: &Path) -> Vec<String> {
+    let output = fd_cmd(root, &[], u64::MAX).output();
     match output {
         Ok(out) => String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -100,7 +205,8 @@ fn run_fd(root: &Path) -> Vec<String> {
 }
 
 fn score_file(root_str: &str, path: &str, query_lower: &str) -> Option<SearchResultItem> {
-    let name = Path::new(path).file_name()?.to_str()?.to_lowercase();
+    let p = Path::new(path);
+    let name = p.file_name()?.to_str()?.to_lowercase();
     let score = fuzzy_score(query_lower, &name)?;
     let display = sanitize_display(
         path.strip_prefix(root_str)
@@ -112,27 +218,41 @@ fn score_file(root_str: &str, path: &str, query_lower: &str) -> Option<SearchRes
         display,
         matches: 0,
         score,
+        priority: path_priority(p),
     })
 }
 
 /// 内容搜索（阻塞式，主要用于测试；App 内走流式 rg_stream）。
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn rg_search(root: &Path, query: &str) -> Vec<SearchResultItem> {
-    let output = rg_cmd(root, query, &[]).output();
+    let globs = rg_exclude_globs(root, &[]);
+    let output = rg_cmd(root, query, &globs, 10 * 1024 * 1024).output();
     let Ok(out) = output else { return Vec::new() };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut items: Vec<SearchResultItem> = stdout
         .lines()
         .filter_map(|line| parse_count_line(root, line))
         .collect();
-    items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.display.cmp(&b.display)));
+    items.sort_by(cmp_items);
     items.truncate(MAX_RESULTS);
     items
 }
 
 /// 构建 rg 命令：以搜索根为工作目录、相对路径搜索，输出 `./path:count`。
 /// 查询中的 `\n` 解码为换行后自动开启 --multiline。
-pub fn rg_cmd(root: &Path, query: &str, exclude_globs: &[String]) -> Command {
+///
+/// 性能/安全参数（见 AGENTS.md）：
+/// - `--hidden` 包含隐藏文件（配合 `!.git` 排除 .git）
+/// - `--no-messages` 抑制 stderr 的权限等错误，避免干扰
+/// - `-j 0` 线程数自动（=CPU 核数）
+/// - `--max-filesize <bytes>` 跳过超大文件（字节数，由 MB 换算而来）
+/// - 二进制文件 rg 默认即跳过（rg 无 grep 的 --binary-files 选项）
+pub fn rg_cmd(
+    root: &Path,
+    query: &str,
+    exclude_globs: &[String],
+    max_filesize_bytes: u64,
+) -> Command {
     let decoded = decode_escapes(query);
     let mut cmd = Command::new("rg");
     // 内容搜索要求精准匹配：--fixed-strings 字面量匹配（不拆词、不当正则），
@@ -142,17 +262,20 @@ pub fn rg_cmd(root: &Path, query: &str, exclude_globs: &[String]) -> Command {
         .arg("--fixed-strings")
         .arg("--case-sensitive")
         .arg("--color=never")
-        .arg("--line-buffered");
+        .arg("--line-buffered")
+        .arg("--hidden")
+        .arg("--no-messages")
+        .arg("-j")
+        .arg("0")
+        .arg("--max-filesize")
+        .arg(max_filesize_bytes.to_string());
     if decoded.contains('\n') {
         cmd.arg("--multiline");
     }
     for g in exclude_globs {
         cmd.arg("--glob").arg(g);
     }
-    cmd.arg("--")
-        .arg(decoded)
-        .arg(".")
-        .current_dir(root);
+    cmd.arg("--").arg(decoded).arg(".").current_dir(root);
     cmd
 }
 
@@ -167,15 +290,18 @@ pub fn parse_count_line(root: &Path, line: &str) -> Option<SearchResultItem> {
     if rel.is_empty() {
         return None;
     }
+    let abs = root.join(rel);
+    let priority = path_priority(&abs);
     Some(SearchResultItem {
-        path: root.join(rel),
+        path: abs,
         display: sanitize_display(rel),
         matches,
         score: matches as i64,
+        priority,
     })
 }
 
-/// 展示用文本清洗：文件/路径名中的控制字符（ESC/BEL/换行等）替换为 �，
+/// 展示用文本清洗：文件/路径名中的控制字符（ESC/BEL/换行等）替换为 U+FFFD，
 /// 避免终端把它当作转义序列执行，造成花屏、内容画出界面框外。
 pub fn sanitize_display(s: &str) -> String {
     if !s.chars().any(|c| c.is_control()) {
@@ -184,19 +310,6 @@ pub fn sanitize_display(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
-}
-
-/// 解析 stderr 中的权限错误：`rg: ./path: Permission denied (os error 13)`，
-/// 返回相对路径。其他类型错误（如 ENOENT 竞态）不缓存，避免误排。
-pub fn parse_error_line(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("rg: ")?;
-    let (path, _) = rest.rsplit_once(": Permission denied")?;
-    let rel = path.strip_prefix("./").unwrap_or(path);
-    if rel.is_empty() || rel == "." {
-        None
-    } else {
-        Some(rel.to_string())
-    }
 }
 
 /// 转义解码：`\n` -> 换行，`\t` -> 制表符，`\r` -> 回车，`\\` -> 反斜杠；
@@ -254,127 +367,6 @@ pub fn encode_paste(raw: &str) -> String {
     out
 }
 
-/// 将不可读路径聚合为尽量少的排除 glob（相对 root）：
-/// - 目录本身不可读 -> 排除整个目录
-/// - 某目录下所有条目都出错 -> 排除整个目录
-/// - 自底向上收敛：某目录的全部条目均已被排除 -> 排除该目录
-/// - 其余 -> 排除单个文件
-/// 宁可少排也不多排，避免漏掉该搜的目录。
-pub fn aggregate_excludes(root: &Path, bad: &[String]) -> Vec<String> {
-    let mut excluded: HashSet<String> = HashSet::new();
-    // 目录 -> 出错文件数
-    let mut dir_errs: HashMap<String, usize> = HashMap::new();
-    for rel in bad {
-        if glob_unusable(rel) {
-            continue;
-        }
-        if root.join(rel).is_dir() {
-            excluded.insert(rel.clone());
-        } else if let Some(parent) = Path::new(rel).parent() {
-            let p = parent.to_string_lossy().into_owned();
-            if !p.is_empty() {
-                *dir_errs.entry(p).or_default() += 1;
-            }
-        }
-    }
-    // 目录下条目全部出错 -> 整目录排除
-    for (dir, cnt) in &dir_errs {
-        if excluded.contains(dir) {
-            continue;
-        }
-        if let Ok(rd) = fs::read_dir(root.join(dir)) {
-            let total = rd.count();
-            if total > 0 && *cnt >= total {
-                excluded.insert(dir.clone());
-            }
-        }
-    }
-    // 未被整目录吸收的出错文件 -> 单文件排除
-    for rel in bad {
-        if glob_unusable(rel) || excluded.contains(rel) || root.join(rel).is_dir() {
-            continue;
-        }
-        if !has_excluded_ancestor(&excluded, rel) {
-            excluded.insert(rel.clone());
-        }
-    }
-    // 自底向上收敛：目录的全部条目均被排除 -> 排除该目录
-    loop {
-        let parents: HashSet<String> = excluded
-            .iter()
-            .filter_map(|p| {
-                let s = Path::new(p).parent()?.to_string_lossy().into_owned();
-                (!s.is_empty()).then_some(s)
-            })
-            .collect();
-        let mut changed = false;
-        for p in parents {
-            if excluded.contains(&p) || glob_unusable(&p) {
-                continue;
-            }
-            if let Ok(rd) = fs::read_dir(root.join(&p)) {
-                let children: Vec<String> = rd
-                    .filter_map(|e| {
-                        let e = e.ok()?;
-                        let name = e.file_name().into_string().ok()?;
-                        Some(format!("{p}/{name}"))
-                    })
-                    .collect();
-                if !children.is_empty() && children.iter().all(|c| excluded.contains(c)) {
-                    excluded.insert(p.clone());
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    // 去掉已被祖先覆盖的冗余项
-    let snapshot = excluded.clone();
-    let mut rels: Vec<String> = excluded
-        .into_iter()
-        .filter(|r| !has_excluded_ancestor(&snapshot, r))
-        .collect();
-    rels.sort();
-    rels.iter().filter_map(|r| exclude_glob(r)).collect()
-}
-
-/// rel 是否有已被排除的祖先目录
-fn has_excluded_ancestor(excluded: &HashSet<String>, rel: &str) -> bool {
-    let mut anc = Path::new(rel).parent();
-    while let Some(a) = anc {
-        let s = a.to_string_lossy();
-        if s.is_empty() {
-            break;
-        }
-        if excluded.contains(s.as_ref()) {
-            return true;
-        }
-        anc = a.parent();
-    }
-    false
-}
-
-/// 含 glob 元字符的路径不做排除（避免误排），宁可下次继续报错误
-fn glob_unusable(rel: &str) -> bool {
-    rel.is_empty()
-        || rel == "."
-        || rel.starts_with('-')
-        || rel.starts_with('#')
-        || rel
-            .chars()
-            .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '!' | '\\'))
-}
-
-/// 相对路径 -> 排除 glob。'/' 前缀锚定到搜索根（要求 rg 以 current_dir=root 运行）。
-fn exclude_glob(rel: &str) -> Option<String> {
-    if glob_unusable(rel) {
-        return None;
-    }
-    Some(format!("!/{rel}"))
-}
-
 /// 文件名模糊打分，返回 None 表示不匹配。
 ///
 /// 规则（见 AGENTS.md）：
@@ -382,6 +374,7 @@ fn exclude_glob(rel: &str) -> Option<String> {
 /// 2. typo 容错：编辑距离 <= allowed，且同时满足
 ///    - 首字符、尾字符与查询词相同（避免 test.shj -> test.sh 这类“打超了”）
 ///    - 文件名只使用查询词中出现过的字符（避免 test.sh -> text.sh 这类引入陌生字符）
+///
 ///    如 test.sh -> tesh.sh（h 是查询词中已有的字符，首尾一致）
 pub fn fuzzy_score(query: &str, name: &str) -> Option<i64> {
     if query.is_empty() || name.is_empty() {
@@ -490,11 +483,7 @@ mod tests {
     }
 
     fn make_temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "sift-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("sift-test-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -538,7 +527,11 @@ mod tests {
 
         let (items, _) = fd_search(&dir, "test.sh", None);
         assert_eq!(items.len(), 1, "got {items:?}");
-        assert!(!items[0].display.chars().any(|c| c.is_control()), "got {:?}", items[0].display);
+        assert!(
+            !items[0].display.chars().any(|c| c.is_control()),
+            "got {:?}",
+            items[0].display
+        );
         assert!(items[0].display.contains('\u{FFFD}'));
         // path 字段保留原始路径，保证打开文件正常
         assert!(items[0].path.exists());
@@ -598,6 +591,39 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// rg 应跳过 .git 目录与超过大小上限的文件
+    #[test]
+    fn rg_search_skips_git_and_oversized() {
+        let dir = make_temp_dir("rgskip");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git/config"), "hello\n").unwrap();
+        fs::write(dir.join("keep.txt"), "hello\n").unwrap();
+        // 一个明显超过 10M 上限的文件（稀疏写入，快速生成）
+        let big = dir.join("big.log");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&big).unwrap();
+            let chunk = "hello\n".repeat(4096); // 24KB
+            for _ in 0..500 {
+                f.write_all(chunk.as_bytes()).unwrap(); // ~12MB
+            }
+        }
+
+        let items = rg_search(&dir, "hello");
+        let names: Vec<_> = items.iter().map(|i| i.display.clone()).collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("keep.txt")),
+            "got {names:?}"
+        );
+        assert!(!names.iter().any(|n| n.contains(".git")), "got {names:?}");
+        assert!(
+            !names.iter().any(|n| n.ends_with("big.log")),
+            "got {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn decode_escapes_basics() {
         assert_eq!(decode_escapes("a\\nb"), "a\nb");
@@ -612,7 +638,10 @@ mod tests {
 
     #[test]
     fn encode_paste_basics() {
-        assert_eq!(encode_paste("ceshi\ntest\n这是/usr/share"), "ceshi\\ntest\\n这是/usr/share");
+        assert_eq!(
+            encode_paste("ceshi\ntest\n这是/usr/share"),
+            "ceshi\\ntest\\n这是/usr/share"
+        );
         assert_eq!(encode_paste("a\r\nb"), "a\\nb");
         assert_eq!(encode_paste("a\rb"), "a\\nb");
         assert_eq!(encode_paste("a\tb"), "a\\tb");
@@ -629,14 +658,14 @@ mod tests {
     #[test]
     fn sanitize_display_replaces_control_chars() {
         assert_eq!(sanitize_display("normal/file.txt"), "normal/file.txt");
-        // ESC 等控制字符替换为 �，且不影响真实路径（path 字段不动，仅清洗展示文本）
-        assert_eq!(sanitize_display("a\u{1b}[31mb.png"), "a�[31mb.png");
-        assert_eq!(sanitize_display("x\u{7}y\u{e}z"), "x�y�z");
+        // ESC 等控制字符替换为 U+FFFD，且不影响真实路径（path 字段不动，仅清洗展示文本）
+        assert_eq!(sanitize_display("a\u{1b}[31mb.png"), "a\u{FFFD}[31mb.png");
+        assert_eq!(sanitize_display("x\u{7}y\u{e}z"), "x\u{FFFD}y\u{FFFD}z");
         assert_eq!(sanitize_display(""), "");
     }
 
     #[test]
-    fn parse_lines() {
+    fn parse_count_lines() {
         let root = Path::new("/data");
         let item = parse_count_line(root, "./a/b.txt:3").unwrap();
         assert_eq!(item.display, "a/b.txt");
@@ -644,56 +673,80 @@ mod tests {
         assert_eq!(item.matches, 3);
         assert!(parse_count_line(root, "./a.txt:0").is_none());
         assert!(parse_count_line(root, "garbage").is_none());
-
-        assert_eq!(
-            parse_error_line("rg: ./closed: Permission denied (os error 13)"),
-            Some("closed".to_string())
-        );
-        assert_eq!(
-            parse_error_line("rg: ./a/b c.txt: Permission denied (os error 13)"),
-            Some("a/b c.txt".to_string())
-        );
-        // 其他错误不缓存
-        assert!(parse_error_line("rg: ./gone: No such file or directory (os error 2)").is_none());
-        assert!(parse_error_line("./a.txt:3").is_none());
     }
 
     #[test]
-    fn aggregate_excludes_rollup() {
-        let dir = make_temp_dir("agg");
-        // a 目录全部文件出错 -> 整目录排除
-        fs::create_dir_all(dir.join("a")).unwrap();
-        fs::write(dir.join("a/f1"), "1").unwrap();
-        fs::write(dir.join("a/f2"), "2").unwrap();
-        // b 目录只有部分文件出错 -> 单文件排除
-        fs::create_dir_all(dir.join("b")).unwrap();
-        fs::write(dir.join("b/f1"), "1").unwrap();
-        fs::write(dir.join("b/f2"), "2").unwrap();
-        // c/d/e 嵌套全部出错 -> 自底向上收敛到 c
-        fs::create_dir_all(dir.join("c/d")).unwrap();
-        fs::write(dir.join("c/d/e"), "3").unwrap();
-        // 目录本身不可读
-        fs::create_dir_all(dir.join("closed")).unwrap();
+    fn path_priority_tiers() {
+        assert_eq!(path_priority(Path::new("/home/heng/a.txt")), 0);
+        assert_eq!(path_priority(Path::new("/etc/hosts")), 0);
+        assert_eq!(path_priority(Path::new("/usr/local/bin/x")), 0);
+        // /usr/local 优先于 /usr（最长前缀）
+        assert_eq!(path_priority(Path::new("/usr/share/x")), 2);
+        assert_eq!(path_priority(Path::new("/var/log/x")), 2);
+        assert_eq!(path_priority(Path::new("/opt/app/x")), 1);
+        assert_eq!(path_priority(Path::new("/home")), 0);
+        assert_eq!(path_priority(Path::new("/usr")), 2);
+    }
 
-        let bad = vec![
-            "a/f1".to_string(),
-            "a/f2".to_string(),
-            "b/f1".to_string(),
-            "c/d/e".to_string(),
-            "closed".to_string(),
-        ];
-        let globs = aggregate_excludes(&dir, &bad);
-        assert!(globs.contains(&"!/a".to_string()), "got {globs:?}");
-        assert!(globs.contains(&"!/b/f1".to_string()), "got {globs:?}");
-        assert!(globs.contains(&"!/c".to_string()), "got {globs:?}");
-        assert!(globs.contains(&"!/closed".to_string()), "got {globs:?}");
-        // 不应误排未出错的 b/f2 或 b 本身
-        assert!(!globs.contains(&"!/b".to_string()), "got {globs:?}");
-        assert!(!globs.contains(&"!/b/f2".to_string()), "got {globs:?}");
-        // 收敛后不应保留冗余子项
-        assert!(!globs.contains(&"!/c/d".to_string()), "got {globs:?}");
-        assert!(!globs.contains(&"!/c/d/e".to_string()), "got {globs:?}");
+    #[test]
+    fn ignore_rels_and_globs() {
+        let root = Path::new("/");
+        let rels = ignore_rels(root, &[]);
+        assert!(rels.contains(&"proc".to_string()), "got {rels:?}");
+        assert!(rels.contains(&"sys".to_string()), "got {rels:?}");
+        assert!(rels.contains(&"var/tmp".to_string()), "got {rels:?}");
 
-        let _ = fs::remove_dir_all(&dir);
+        let globs = rg_exclude_globs(root, &["/data/logs".to_string()]);
+        assert!(globs.contains(&"!.git".to_string()), "got {globs:?}");
+        assert!(globs.contains(&"!/proc".to_string()), "got {globs:?}");
+        assert!(globs.contains(&"!/data/logs".to_string()), "got {globs:?}");
+
+        // root=/home 时 /proc 不在其下，不应出现；用户额外目录若不在 root 下也忽略
+        let rels2 = ignore_rels(Path::new("/home"), &["/proc".to_string()]);
+        assert!(!rels2.contains(&"proc".to_string()), "got {rels2:?}");
+
+        // root=/var 时 /var/tmp -> tmp、/var/cache -> cache、/var/lib -> lib
+        let rels3 = ignore_rels(Path::new("/var"), &[]);
+        assert!(rels3.contains(&"tmp".to_string()), "got {rels3:?}");
+        assert!(rels3.contains(&"cache".to_string()), "got {rels3:?}");
+        assert!(rels3.contains(&"lib".to_string()), "got {rels3:?}");
+
+        // fd 排除项带 '/' 前缀锚定
+        let fde = fd_excludes(root, &[]);
+        assert!(fde.contains(&"/proc".to_string()), "got {fde:?}");
+    }
+
+    #[test]
+    fn fd_cmd_contains_size_and_excludes() {
+        let cmd = fd_cmd(Path::new("/"), &["/proc".to_string()], 1048576);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // 大小上限：--size -<字节>b（与 rg --max-filesize 一致）
+        let size_pos = args.iter().position(|a| a == "--size").expect("--size");
+        assert_eq!(args[size_pos + 1], "-1048576b");
+        // 忽略目录：--exclude /proc
+        let ex_pos = args.iter().position(|a| a == "--exclude").expect("--exclude");
+        assert_eq!(args[ex_pos + 1], "/proc");
+    }
+
+    #[test]
+    fn rg_cmd_contains_perf_flags() {
+        let cmd = rg_cmd(Path::new("/tmp"), "q", &["!.git".to_string()], 1048576);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for flag in [
+            "--hidden",
+            "--no-messages",
+            "--max-filesize",
+            "1048576",
+            "-j",
+            "0",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "missing {flag} in {args:?}");
+        }
     }
 }

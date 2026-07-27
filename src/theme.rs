@@ -70,9 +70,7 @@ pub fn title_style() -> Style {
 
 /// 占位提示（预览为空等）
 pub fn placeholder() -> Style {
-    Style::default()
-        .fg(OVERLAY1)
-        .add_modifier(Modifier::ITALIC)
+    Style::default().fg(OVERLAY1).add_modifier(Modifier::ITALIC)
 }
 
 /// 列表选中行

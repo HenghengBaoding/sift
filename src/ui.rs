@@ -12,25 +12,38 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, MAX_RESULTS};
+use crate::app::{App, PopupKind, MAX_RESULTS};
 use crate::search::{sanitize_display, SearchMode, SearchResultItem};
 use crate::theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+
+    // 顶部搜索输入框：查询过长时按宽度硬折行，高度按折行数动态计算
+    // （最多占约 1/3 屏高，避免长查询挤掉结果列表）
+    let input_inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let input_wrapped = wrap_by_width(&app.input, input_inner_w);
+    let input_max_content = (area.height / 3).clamp(1, 8) as usize;
+    let input_h = input_wrapped.len().clamp(1, input_max_content) as u16 + 2;
+
+    // 底部快捷键提示栏：一行放不下时自动折行，高度按折行数动态计算
+    let footer_lines = build_footer_lines(area.width);
+    let footer_h = (footer_lines.len() as u16).clamp(1, 4) + 2;
+
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // 搜索输入框
-            Constraint::Min(3),    // 中部
-            Constraint::Length(3), // 快捷键提示
+            Constraint::Length(input_h),  // 搜索输入框（可折行）
+            Constraint::Min(3),           // 中部
+            Constraint::Length(footer_h), // 快捷键提示（可折行）
         ])
-        .split(f.area());
+        .split(area);
 
     draw_input(f, app, root[0]);
 
@@ -56,15 +69,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_preview(f, app, right[0]);
     draw_path(f, right[1], &full_path);
-    draw_footer(f, app, root[2]);
+    draw_footer(f, root[2], footer_lines);
 
-    // 路径编辑弹窗（最顶层）
-    if app.editing_path {
-        draw_path_popup(f, app);
+    // 编辑弹窗（路径 / 忽略目录 / 大小上限）
+    if app.popup.is_some() {
+        draw_popup(f, app);
     }
-    // “搜索进行中”提示弹窗（3 秒自动消失）
-    if app.busy_popup_since.is_some() {
-        draw_busy_popup(f);
+
+    // 状态提示弹框（toast，最顶层）：取消搜索 / 编辑器 / 配置错误等临时消息，
+    // 居中展示、到期自动消失（取代旧的底栏内嵌提示，底栏太窄放不下）
+    if app.status.is_some() {
+        draw_toast(f, app);
     }
 }
 
@@ -101,8 +116,8 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" (Ctrl+P)", Style::default().fg(theme::OVERLAY1)),
         Span::raw(" "),
     ]);
-    // 路径弹窗打开时，焦点在弹窗上，输入框边框降回普通色
-    let mut block = if app.editing_path {
+    // 弹窗打开时，焦点在弹窗上，输入框边框降回普通色
+    let mut block = if app.popup.is_some() {
         theme::panel(title)
     } else {
         theme::panel_focused(title)
@@ -129,17 +144,26 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
             .alignment(Alignment::Right),
         );
     }
-    let input = Paragraph::new(app.input.as_str())
+    // 按宽度硬折行（字符级、宽字符不拆分），与 draw() 里计算高度的折行保持一致
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let lines: Vec<Line> = wrap_by_width(&app.input, inner_w)
+        .into_iter()
+        .map(|l| Line::from(Span::raw(l)))
+        .collect();
+    let input = Paragraph::new(lines)
         .block(block)
         .style(Style::default().fg(theme::TEXT));
     f.render_widget(input, area);
 
-    // 光标（支持宽字符）
-    if !app.editing_path {
-        let prefix: String = app.input.chars().take(app.cursor).collect();
-        let x = area.x + 1 + UnicodeWidthStr::width(prefix.as_str()) as u16;
+    // 光标（支持宽字符与折行）：定位到光标所在折行的行/列
+    if app.popup.is_none() {
+        let (line, col_w) = cursor_line_col(&app.input, app.cursor, inner_w);
+        // 输入框过高被 clamp 时，光标行可能超出可见区域，收敛到最后一行
+        let visible_lines = area.height.saturating_sub(2).max(1) as usize;
+        let line = line.min(visible_lines.saturating_sub(1));
+        let x = area.x + 1 + col_w as u16;
         let max_x = area.x + area.width.saturating_sub(2);
-        f.set_cursor_position((x.min(max_x), area.y + 1));
+        f.set_cursor_position((x.min(max_x), area.y + 1 + line as u16));
     }
 }
 
@@ -235,7 +259,10 @@ fn list_title_right(app: &App) -> Option<Line<'static>> {
     let line = if app.searching {
         Line::from(vec![
             Span::styled(" 搜索中 ", Style::default().fg(theme::YELLOW)),
-            Span::styled(format!("{} ", spinner()), Style::default().fg(theme::YELLOW)),
+            Span::styled(
+                format!("{} ", spinner()),
+                Style::default().fg(theme::YELLOW),
+            ),
             Span::styled(format!("{count} 项 "), theme::title_style()),
         ])
     } else {
@@ -370,82 +397,116 @@ fn draw_path(f: &mut Frame, area: Rect, full_path: &str) {
     f.render_widget(paragraph, area);
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let key = |k: &'static str| -> Span<'static> {
-        Span::styled(
-            k,
-            Style::default()
-                .fg(theme::YELLOW)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    let desc = |d: &'static str| -> Span<'static> {
-        Span::styled(d, Style::default().fg(theme::OVERLAY1))
-    };
-    let sep = || Span::raw("  ");
-    let mut spans = vec![
-        key("Tab"),
-        desc(":切换模式"),
-        sep(),
-        key("Ctrl+P"),
-        desc(":修改路径"),
-        sep(),
-        key("↑/↓"),
-        desc(":选择"),
-        sep(),
-        key("Ctrl+J/K"),
-        desc(":滚动预览"),
-        sep(),
-        key("Enter"),
-        desc(":搜索"),
-        sep(),
-        key("Ctrl+G"),
-        desc(":打开"),
-        sep(),
-        key("Esc"),
-        desc(":退出"),
-    ];
-    if let Some((msg, _)) = &app.status {
-        spans.push(Span::raw("  |  "));
-        spans.push(Span::styled(msg.clone(), Style::default().fg(theme::RED)));
+/// 底部快捷键条目：(按键, 说明)
+fn footer_items() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Tab", ":切换模式"),
+        ("Ctrl+P", ":路径"),
+        ("Ctrl+I", ":忽略目录"),
+        ("Ctrl+S", ":大小上限"),
+        ("↑/↓", ":选择"),
+        ("Ctrl+J/K", ":滚动预览"),
+        ("Enter", ":搜索"),
+        ("Ctrl+G", ":打开"),
+        ("Esc", ":取消/退出"),
+    ]
+}
+
+fn footer_key(k: &'static str) -> Span<'static> {
+    Span::styled(
+        k,
+        Style::default()
+            .fg(theme::YELLOW)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn footer_desc(d: &'static str) -> Span<'static> {
+    Span::styled(d, Style::default().fg(theme::OVERLAY1))
+}
+
+/// 按可用宽度把快捷键条目贪心打包成多行（整条不拆分），实现折行。
+fn build_footer_lines(width: u16) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(2).max(1) as usize; // 去掉左右边框
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+
+    for (k, d) in footer_items() {
+        let item_w = UnicodeWidthStr::width(k) + UnicodeWidthStr::width(d);
+        let need = if cur.is_empty() { item_w } else { item_w + 2 }; // 2 = 分隔空格
+        if !cur.is_empty() && cur_w + need > inner {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            cur_w = 0;
+        }
+        if !cur.is_empty() {
+            cur.push(Span::raw("  "));
+            cur_w += 2;
+        }
+        cur.push(footer_key(k));
+        cur.push(footer_desc(d));
+        cur_w += item_w;
     }
-    let footer = Paragraph::new(Line::from(spans)).block(theme::panel(Line::default()));
+    if !cur.is_empty() {
+        lines.push(Line::from(cur));
+    }
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines
+}
+
+fn draw_footer(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let footer = Paragraph::new(lines).block(theme::panel(Line::default()));
     f.render_widget(footer, area);
 }
 
-/// Ctrl+P 路径编辑弹窗
-fn draw_path_popup(f: &mut Frame, app: &App) {
+/// 编辑弹窗：路径（Ctrl+P）/ 忽略目录（Ctrl+I）/ 大小上限（Ctrl+S）共用一套渲染
+fn draw_popup(f: &mut Frame, app: &App) {
+    let Some(kind) = app.popup else { return };
     let area = f.area();
     let width = (area.width * 3 / 5).clamp(24, 72).min(area.width);
     // 有校验错误时弹窗加高一行展示错误信息
-    let height = (if app.path_error.is_some() { 4 } else { 3 }).min(area.height);
+    let height = (if app.popup_error.is_some() { 4 } else { 3 }).min(area.height);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
     };
+    let (title_main, hint, color): (&str, &str, Color) = match kind {
+        PopupKind::Path => (
+            " 搜索路径 ",
+            "(Enter 确认 / Esc 取消，支持 ~)",
+            theme::MAUVE,
+        ),
+        PopupKind::IgnoreDirs => (
+            " 忽略目录 ",
+            "(逗号分隔，Enter 确认 / Esc 取消)",
+            theme::PEACH,
+        ),
+        PopupKind::MaxSize => (
+            " 文件大小上限(M) ",
+            "(数字，Enter 确认 / Esc 取消)",
+            theme::GREEN,
+        ),
+    };
     let title = Line::from(vec![
         Span::styled(
-            " 搜索路径 ",
-            Style::default()
-                .fg(theme::MAUVE)
-                .add_modifier(Modifier::BOLD),
+            title_main,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "(Enter 确认 / Esc 取消，支持 ~)",
-            Style::default().fg(theme::OVERLAY1),
-        ),
+        Span::styled(hint, Style::default().fg(theme::OVERLAY1)),
         Span::raw(" "),
     ]);
     // 全选状态下整行高亮，提示用户输入即替换
-    let input_line = if app.path_select_all {
-        Line::from(Span::styled(app.path_input.as_str(), theme::selected()))
+    let input_line = if app.popup_select_all {
+        Line::from(Span::styled(app.popup_input.as_str(), theme::selected()))
     } else {
-        Line::from(app.path_input.as_str())
+        Line::from(app.popup_input.as_str())
     };
     let mut lines = vec![input_line];
-    if let Some(err) = &app.path_error {
+    if let Some(err) = &app.popup_error {
         lines.push(Line::from(Span::styled(
             err.clone(),
             Style::default().fg(theme::RED),
@@ -458,26 +519,27 @@ fn draw_path_popup(f: &mut Frame, app: &App) {
     f.render_widget(input, popup);
 
     // 弹窗内光标
-    let prefix: String = app.path_input.chars().take(app.path_cursor).collect();
+    let prefix: String = app.popup_input.chars().take(app.popup_cursor).collect();
     let x = popup.x + 1 + UnicodeWidthStr::width(prefix.as_str()) as u16;
     let max_x = popup.x + popup.width.saturating_sub(2);
     f.set_cursor_position((x.min(max_x), popup.y + 1));
 }
 
-/// “搜索进行中”提示弹窗：搜索未结束时按 Enter / Tab 弹出，3 秒自动消失
-fn draw_busy_popup(f: &mut Frame) {
+/// 状态提示弹框（toast）：居中展示 app.status 消息，到期由 app.tick() 自动清除。
+/// 取代旧的底栏内嵌提示（底栏太窄放不下完整消息）。
+fn draw_toast(f: &mut Frame, app: &App) {
+    let Some((msg, _)) = &app.status else { return };
     let area = f.area();
-    let lines = [
-        "当前搜索还没执行完，先别急～",
-        "等它完成后再重新搜索或切换模式",
-    ];
-    let text_w = lines
-        .iter()
-        .map(|l| UnicodeWidthStr::width(*l))
-        .max()
-        .unwrap_or(0) as u16;
-    let width = (text_w + 4).clamp(24, area.width);
-    let height = (lines.len() as u16 + 2).min(area.height);
+    let msg_w = UnicodeWidthStr::width(msg.as_str()) as u16;
+    // 宽度贴合文本（含边框与左右留白），并限制在可用区域内
+    let width = (msg_w + 4)
+        .clamp(24, 72)
+        .min(area.width.saturating_sub(2))
+        .max(area.width.min(24));
+    let inner_w = width.saturating_sub(2).max(1) as usize;
+    // 文本超出宽度时自动换行，弹框随之加高
+    let lines = wrap_lines(msg, inner_w) as u16;
+    let height = (lines + 2).clamp(3, area.height);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -485,32 +547,18 @@ fn draw_busy_popup(f: &mut Frame) {
         height,
     };
     let title = Line::from(Span::styled(
-        " 搜索进行中 ",
+        " 提示 ",
         Style::default()
             .fg(theme::PEACH)
             .add_modifier(Modifier::BOLD),
     ));
-    let block = theme::panel(title)
-        .border_style(Style::default().fg(theme::PEACH))
-        .title_bottom(
-            Line::from(Span::styled(
-                " 3 秒后自动关闭 ",
-                Style::default().fg(theme::OVERLAY1),
-            ))
-            .alignment(Alignment::Right),
-        );
-    let body: Vec<Line> = lines
-        .iter()
-        .map(|l| {
-            Line::from(Span::styled(
-                l.to_string(),
-                Style::default().fg(theme::TEXT),
-            ))
-            .alignment(Alignment::Center)
-        })
-        .collect();
+    let paragraph = Paragraph::new(msg.as_str())
+        .block(theme::popup(title))
+        .style(Style::default().fg(theme::TEXT))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
     f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(body).block(block), popup);
+    f.render_widget(paragraph, popup);
 }
 
 /// 估算折行数（按显示宽度）
@@ -520,6 +568,48 @@ fn wrap_lines(text: &str, width: usize) -> usize {
     }
     let w = UnicodeWidthStr::width(text);
     (w / width) + 1
+}
+
+/// 按显示宽度把文本硬折行（字符级，宽字符不拆分），至少返回一行。
+/// 用于搜索输入框：与终端输入一致的可预期折行，便于光标定位。
+fn wrap_by_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for c in text.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if cur_w + cw > width {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(c);
+        cur_w += cw;
+    }
+    lines.push(cur);
+    lines
+}
+
+/// 计算光标（字符索引 cursor）在折行文本中的（行号, 列显示宽度）。
+/// 折行规则与 wrap_by_width 完全一致，保证光标落在正确的行/列。
+fn cursor_line_col(text: &str, cursor: usize, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    let mut line = 0usize;
+    let mut col_w = 0usize;
+    for (i, c) in text.chars().enumerate() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        // 与 wrap_by_width 一致：当前行放不下则先换行，
+        // 保证光标恰好落在折行边界时位于下一行行首（与下一个字符位置一致）
+        if col_w + cw > width {
+            line += 1;
+            col_w = 0;
+        }
+        if i == cursor {
+            return (line, col_w);
+        }
+        col_w += cw;
+    }
+    (line, col_w)
 }
 
 #[cfg(test)]
@@ -603,16 +693,6 @@ mod tests {
         assert!(!s.contains(&"a".repeat(100)), "{s}");
     }
 
-    #[test]
-    fn busy_popup_rendered_while_searching() {
-        let mut app = App::new();
-        app.busy_popup_since = Some(std::time::Instant::now());
-        let s = render_to_string(&mut app, 100, 30);
-        assert!(s.contains("搜索进行中"), "{s}");
-        assert!(s.contains("先别急"), "{s}");
-        assert!(s.contains("切换模式"), "{s}");
-    }
-
     /// 文件名含 ESC 等控制字符时，整个界面（列表/路径框）不得把控制字符写进终端
     #[test]
     fn control_chars_in_names_never_reach_screen() {
@@ -623,6 +703,7 @@ mod tests {
             display: sanitize_display("ctrl_\u{1b}[31m_test.sh"),
             matches: 0,
             score: 100,
+            priority: 1,
         }];
         app.list_state.select(Some(0));
 
@@ -637,6 +718,19 @@ mod tests {
         }
     }
 
+    /// 状态消息（如取消搜索）以居中 toast 弹框展示，不再塞进狭窄的底栏
+    #[test]
+    fn status_shown_as_centered_toast() {
+        let mut app = App::new();
+        app.set_status("已取消当前搜索");
+        let s = render_to_string(&mut app, 100, 30);
+        // toast 弹框标题与完整消息都展示在屏幕上
+        assert!(s.contains("提示"), "{s}");
+        assert!(s.contains("已取消当前搜索"), "{s}");
+        // 底栏不再有内嵌的 "|  消息" 形式
+        assert!(!s.contains("|  已取消当前搜索"), "{s}");
+    }
+
     #[test]
     fn input_dirty_logic() {
         let mut app = App::new();
@@ -646,6 +740,31 @@ mod tests {
         app.last_query = "x".to_string();
         // trim 后一致 => 不算脏
         assert!(!app.input_dirty());
+    }
+
+    #[test]
+    fn wrap_by_width_ascii_and_wide() {
+        // 空文本至少一行
+        assert_eq!(wrap_by_width("", 10), vec![""]);
+        // ASCII 按宽度硬折行
+        assert_eq!(wrap_by_width("abcdef", 3), vec!["abc", "def"]);
+        assert_eq!(wrap_by_width("abcdefg", 3), vec!["abc", "def", "g"]);
+        // 宽字符（中文=2 列）不被拆分：第 3 列放不下整个字就换行
+        assert_eq!(wrap_by_width("中文搜索", 3), vec!["中", "文", "搜", "索"]);
+        assert_eq!(wrap_by_width("中文搜索", 4), vec!["中文", "搜索"]);
+        // 混合：ab(2) + 中(2) = 4 刚好填满宽 4
+        assert_eq!(wrap_by_width("ab中文", 4), vec!["ab中", "文"]);
+    }
+
+    #[test]
+    fn cursor_line_col_tracks_wrap() {
+        // "abcdef" 宽 3 折为 ["abc","def"]
+        assert_eq!(cursor_line_col("abcdef", 0, 3), (0, 0));
+        assert_eq!(cursor_line_col("abcdef", 3, 3), (1, 0)); // 光标在第二行行首
+        assert_eq!(cursor_line_col("abcdef", 6, 3), (1, 3)); // 末尾
+        // 宽字符："中文搜索" 宽 4 折为 ["中文","搜索"]，光标在 "搜" 前 => 第 2 行行首
+        assert_eq!(cursor_line_col("中文搜索", 2, 4), (1, 0));
+        assert_eq!(cursor_line_col("中文搜索", 4, 4), (1, 4));
     }
 }
 
@@ -670,4 +789,3 @@ fn truncate_width(s: &str, max: usize) -> String {
     out.push('…');
     out
 }
-

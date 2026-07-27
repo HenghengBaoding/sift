@@ -1,6 +1,7 @@
 //! sift — 基于 fd / rg / bat 的终端文件搜索工具（仅 Linux）。
 
 mod app;
+mod config;
 mod editor;
 mod preview;
 mod search;
@@ -17,7 +18,9 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -62,7 +65,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
     while !app.should_quit {
         terminal.draw(|f| ui::draw(f, app))?;
 
-        if event::poll(Duration::from_millis(60))? {
+        if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) => {
                     if let Some(Action::Open(path)) = app.on_key(key) {

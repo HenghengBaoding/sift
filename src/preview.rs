@@ -23,9 +23,9 @@ const FALLBACK_MAX_BYTES: usize = 256 * 1024;
 /// 常见图片扩展名：图片不支持预览，直接给出提示，
 /// 避免二进制内容经 bat / 兜底读取输出到终端造成花屏
 const IMAGE_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "icns", "svg", "tif", "tiff",
-    "avif", "heic", "heif", "jxl", "psd", "raw", "cr2", "nef", "arw", "dng", "ppm",
-    "pgm", "pbm", "xpm", "exr", "hdr",
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "icns", "svg", "tif", "tiff", "avif",
+    "heic", "heif", "jxl", "psd", "raw", "cr2", "nef", "arw", "dng", "ppm", "pgm", "pbm", "xpm",
+    "exr", "hdr",
 ];
 
 pub fn render(path: &Path, width: u16) -> Text<'static> {
@@ -183,7 +183,12 @@ mod tests {
         let joined: String = text
             .lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("hello sift"), "got: {joined}");
@@ -203,7 +208,12 @@ mod tests {
         let joined: String = text
             .lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect();
         assert!(joined.contains("二进制文件"), "got: {joined}");
 
@@ -230,7 +240,12 @@ mod tests {
         let joined: String = text
             .lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("已截断"), "marker missing");
@@ -253,7 +268,12 @@ mod tests {
         let joined: String = text
             .lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect();
         assert!(joined.contains("图片"), "got: {joined}");
         assert!(!joined.contains("no nul bytes"), "got: {joined}");
@@ -294,7 +314,12 @@ mod tests {
         let joined: String = text
             .lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect();
         assert!(!joined.is_empty());
     }
