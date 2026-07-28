@@ -24,6 +24,7 @@ use ratatui::widgets::ListState;
 use crate::config;
 use crate::preview;
 use crate::search::{self, SearchMode, SearchResultItem};
+use crate::ui;
 
 /// 文件名列表缓存有效期
 const FILE_LIST_TTL: Duration = Duration::from_secs(60);
@@ -122,6 +123,13 @@ pub struct App {
     pub input: String,
     /// 光标位置（按字符计）
     pub cursor: usize,
+    /// 顶部搜索输入框是否展开（Ctrl+H 切换）：
+    /// 展开时高度最大为页面 1/3（超出滚动查看）；折叠时单行高度、超出以省略号截断
+    pub input_expanded: bool,
+    /// 展开态下输入框内容超出可视区时的滚动偏移（顶部可见折行号，由绘制层维护）
+    pub input_scroll: usize,
+    /// 搜索输入框内容区宽度（由绘制层维护）：↑/↓ 按视觉折行上下移动光标时需要它来计算折行
+    pub input_inner_width: usize,
 
     pub results: Vec<SearchResultItem>,
     pub list_state: ListState,
@@ -177,6 +185,9 @@ impl App {
             popup_error: None,
             input: String::new(),
             cursor: 0,
+            input_expanded: true,
+            input_scroll: 0,
+            input_inner_width: 1,
             results: Vec::new(),
             list_state: ListState::default(),
             list_offset: 0,
@@ -253,16 +264,23 @@ impl App {
             return None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            // Esc / Ctrl+C：搜索进行中 -> 取消当前搜索；否则退出程序
+            // Esc：搜索进行中 -> 取消当前搜索；否则退出程序
             KeyCode::Esc => self.cancel_or_quit(),
-            KeyCode::Char('c') if ctrl => self.cancel_or_quit(),
+            // Ctrl+C：复制选中文件的完整路径到系统剪贴板（不再用于取消/退出，退出用 Esc）
+            KeyCode::Char('c') if ctrl => self.copy_selected_path(),
             // Tab 切换模式：即便搜索进行中也会先取消旧搜索再切换重搜（不再阻塞等待）
             KeyCode::Tab => {
                 self.mode.toggle();
                 self.trigger_search_now();
             }
             KeyCode::Char('p') if ctrl => self.open_popup(PopupKind::Path),
+            // Ctrl+H 展开/折叠顶部搜索输入框（折叠=单行截断，展开=最高 1/3 屏、可滚动）
+            KeyCode::Char('h') if ctrl => {
+                self.input_expanded = !self.input_expanded;
+                self.input_scroll = 0;
+            }
             // 忽略目录 / 大小上限对文件名搜索（fd）与内容搜索（rg）同样生效
             KeyCode::Char('i') if ctrl => self.open_popup(PopupKind::IgnoreDirs),
             KeyCode::Char('s') if ctrl => self.open_popup(PopupKind::MaxSize),
@@ -270,8 +288,21 @@ impl App {
             KeyCode::Char('k') if ctrl => self.scroll_preview(-3),
             KeyCode::PageDown => self.scroll_preview(10),
             KeyCode::PageUp => self.scroll_preview(-10),
-            KeyCode::Down => self.move_selection(1),
-            KeyCode::Up => self.move_selection(-1),
+            // Alt+J / Alt+K：选择下一个 / 上一个文件。
+            // 多数终端上报为小写+ALT，少数上报为大写字母+ALT，两者都兼容。
+            KeyCode::Char('j') if alt => self.move_selection(1),
+            KeyCode::Char('k') if alt => self.move_selection(-1),
+            KeyCode::Char('J') if alt => self.move_selection(1),
+            KeyCode::Char('K') if alt => self.move_selection(-1),
+            // ↑/↓：展开态下在搜索输入框中按视觉折行上下移动光标（折叠态不处理）
+            KeyCode::Down => self.move_input_cursor_vertical(1),
+            KeyCode::Up => self.move_input_cursor_vertical(-1),
+            // Shift+Enter 插入真实换行（多行查询；内容搜索自动启用 --multiline）
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let byte = char_byte(&self.input, self.cursor);
+                self.input.insert(byte, '\n');
+                self.cursor += 1;
+            }
             // Enter 触发搜索：若上一次还在跑，会先 kill 旧进程再搜新关键词
             KeyCode::Enter => self.trigger_search_now(),
             KeyCode::Char('g') if ctrl => {
@@ -320,12 +351,47 @@ impl App {
         }
     }
 
+    /// Ctrl+C：把选中文件的完整路径复制到系统剪贴板（wl-copy/xclip/xsel）。
+    /// 无选中文件或复制失败时以 toast 提示原因。
+    fn copy_selected_path(&mut self) {
+        let Some(item) = self.selected_item() else {
+            self.set_status("无选中文件，无法复制路径");
+            return;
+        };
+        let path = item.path.display().to_string();
+        match crate::clipboard::copy(&path) {
+            Ok(()) => self.set_status("已复制文件路径到剪贴板"),
+            Err(e) => self.set_status(format!("复制失败：{e}")),
+        }
+    }
+
     /// 粘贴事件（bracketed paste）：原始文本可能含换行/制表符/反斜杠，
     /// 编码为查询转义形式后插入（多行文本 -> \n 序列，自动启用 --multiline）
     pub fn on_paste(&mut self, text: &str) {
         if self.popup.is_some() {
-            // 弹窗输入框：单行，换行/回车及其他控制字符（ESC 等）直接丢弃，防止花屏
-            let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+            // 忽略目录为多行输入：保留换行（\r\n / \r 归一化为 \n），其余控制字符丢弃；
+            // 路径 / 大小上限为单行，换行及其他控制字符（ESC 等）直接丢弃，防止花屏
+            let multiline = matches!(self.popup, Some(PopupKind::IgnoreDirs));
+            let cleaned: String = if multiline {
+                let mut out = String::with_capacity(text.len());
+                let mut chars = text.chars().peekable();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\n' => out.push('\n'),
+                        '\r' => {
+                            if chars.peek() == Some(&'\n') {
+                                chars.next();
+                            }
+                            out.push('\n');
+                        }
+                        c if c.is_control() => {}
+                        c => out.push(c),
+                    }
+                }
+                out
+            } else {
+                text.chars().filter(|c| !c.is_control()).collect()
+            };
             let n = cleaned.chars().count();
             if self.popup_select_all {
                 // 全选状态下粘贴 = 整体替换
@@ -356,7 +422,7 @@ impl App {
     fn open_popup(&mut self, kind: PopupKind) {
         self.popup_input = match kind {
             PopupKind::Path => self.current_path_display(),
-            PopupKind::IgnoreDirs => self.ignore_dirs.join(", "),
+            PopupKind::IgnoreDirs => self.ignore_dirs.join("\n"),
             PopupKind::MaxSize => format_size_mb(self.max_file_size_mb),
         };
         self.popup_cursor = self.popup_input.chars().count();
@@ -410,6 +476,16 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.popup = None,
+            // Shift+Enter 插入真实换行（仅忽略目录为多行；路径/大小上限等同 Enter 确认）
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if matches!(self.popup, Some(PopupKind::IgnoreDirs)) {
+                    let byte = char_byte(&self.popup_input, self.popup_cursor);
+                    self.popup_input.insert(byte, '\n');
+                    self.popup_cursor += 1;
+                } else {
+                    self.confirm_popup();
+                }
+            }
             KeyCode::Enter => self.confirm_popup(),
             KeyCode::Backspace => {
                 if self.popup_cursor > 0 {
@@ -434,10 +510,10 @@ impl App {
                 self.popup_input.clear();
                 self.popup_cursor = 0;
             }
-            // 删除到上一个分隔符（路径为 '/'，忽略目录为 ','）不含分隔符本身
+            // 删除到上一个分隔符（路径为 '/'，忽略目录为换行）不含分隔符本身
             KeyCode::Char('w') if ctrl => {
                 let sep = match self.popup {
-                    Some(PopupKind::IgnoreDirs) => ',',
+                    Some(PopupKind::IgnoreDirs) => '\n',
                     _ => '/',
                 };
                 while self.popup_cursor > 0 {
@@ -492,11 +568,11 @@ impl App {
         }
     }
 
-    /// 确认忽略目录：英文逗号分隔，逐个校验为真实存在的目录；空输入 = 清空额外忽略
+    /// 确认忽略目录：换行分隔（Shift+Enter 或输入 \n），逐个校验为真实存在的目录；空输入 = 清空额外忽略
     fn confirm_ignore_dirs(&mut self) {
-        let raw = self.popup_input.clone();
+        let decoded = search::decode_escapes(&self.popup_input);
         let mut dirs: Vec<String> = Vec::new();
-        for part in raw.split(',') {
+        for part in decoded.split('\n') {
             let p = part.trim();
             if p.is_empty() {
                 continue;
@@ -773,6 +849,15 @@ impl App {
         }
     }
 
+    /// ↑/↓：展开态下在搜索输入框中按视觉折行上下移动光标（尽量保持原列）；折叠态不处理。
+    fn move_input_cursor_vertical(&mut self, delta: isize) {
+        if !self.input_expanded {
+            return;
+        }
+        let width = self.input_inner_width.max(1);
+        self.cursor = ui::move_cursor_vertical(&self.input, self.cursor, width, true, delta);
+    }
+
     fn scroll_preview(&mut self, delta: i32) {
         let cur = self.preview_scroll as i32;
         let max = self.preview_max_scroll as i32;
@@ -1034,8 +1119,16 @@ mod tests {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
     }
 
+    fn shift_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    }
+
     fn esc() -> KeyEvent {
         KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
     }
 
     /// 搜索进行中按 Enter：取消旧搜索并立即重搜（gen 递增、仍处于搜索中）
@@ -1064,7 +1157,7 @@ mod tests {
         assert!(app.search_gen > gen, "Tab 应派发新搜索");
     }
 
-    /// Esc / Ctrl+C：搜索中取消搜索（不退出）；非搜索时退出程序
+    /// Esc：搜索中取消搜索（不退出）；非搜索时退出程序
     #[test]
     fn esc_cancels_search_or_quits() {
         let mut app = App::new();
@@ -1075,13 +1168,36 @@ mod tests {
 
         app.on_key(esc());
         assert!(app.should_quit, "非搜索时 Esc 应退出");
+    }
 
-        // Ctrl+C 同理
-        let mut app2 = App::new();
-        app2.searching = true;
-        app2.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(!app2.should_quit);
-        assert!(!app2.searching);
+    /// Ctrl+C 用于复制选中文件路径：任何情况下都不退出程序，也不取消搜索
+    #[test]
+    fn ctrl_c_copies_path_and_never_quits() {
+        // 无选中文件：不退出，提示无法复制
+        let mut app = App::new();
+        app.on_key(ctrl_c());
+        assert!(!app.should_quit, "Ctrl+C 不应退出程序");
+        assert!(app.status.is_some(), "无选中文件应给出提示");
+
+        // 有选中文件：不退出，且给出 toast（成功/失败取决于环境，都算有反馈）
+        let mut app = App::new();
+        app.results = vec![item("/home/heng/test.sh", "home/heng/test.sh", 10)];
+        app.list_state.select(Some(0));
+        app.on_key(ctrl_c());
+        assert!(!app.should_quit, "Ctrl+C 不应退出程序");
+        assert!(app.status.is_some(), "复制后应有 toast 反馈");
+    }
+
+    /// Ctrl+C 不再取消搜索（取消搜索改用 Esc）：搜索中按 Ctrl+C 仅复制路径
+    #[test]
+    fn ctrl_c_does_not_cancel_search() {
+        let mut app = App::new();
+        app.searching = true;
+        app.results = vec![item("/home/heng/test.sh", "home/heng/test.sh", 10)];
+        app.list_state.select(Some(0));
+        app.on_key(ctrl_c());
+        assert!(app.searching, "Ctrl+C 不应取消搜索");
+        assert!(!app.should_quit, "Ctrl+C 不应退出");
     }
 
     /// 流式批次到达后结果重排序，选中项被“挤”到别的文件时预览必须跟着刷新，
@@ -1306,7 +1422,7 @@ mod tests {
         let _ = std::fs::remove_file(app.config_path.as_ref().unwrap());
     }
 
-    /// 忽略目录弹窗：逗号分隔、逐个校验真实目录；空输入清空；写入配置文件
+    /// 忽略目录弹窗：换行分隔（Shift+Enter 或 \n）、逐个校验真实目录；空输入清空；写入配置文件
     #[test]
     fn ignore_dirs_popup_validates_and_persists() {
         let mut app = App::new();
@@ -1321,9 +1437,9 @@ mod tests {
         assert_eq!(app.popup, Some(PopupKind::IgnoreDirs));
         assert!(app.popup_error.is_some());
 
-        // 合法目录（逗号分隔，含尾部空格与空项）-> 接受并保存
+        // 合法目录（换行分隔，含空行与行首尾空格）-> 接受并保存
         let tmp = std::env::temp_dir();
-        app.popup_input = format!("{}, ,", tmp.display());
+        app.popup_input = format!("{}\n \n", tmp.display());
         app.popup_error = None;
         app.on_key(enter());
         assert_eq!(app.popup, None);
@@ -1340,6 +1456,109 @@ mod tests {
         assert_eq!(loaded.ignore_dirs, app.ignore_dirs);
 
         let _ = std::fs::remove_file(&cfg_file);
+    }
+
+    /// 忽略目录改用换行分隔：打开弹窗时以换行连接；输入的 \n 转义与 Shift+Enter 真实换行都生效
+    #[test]
+    fn ignore_dirs_newline_separated() {
+        let mut app = App::new();
+        app.config_path =
+            Some(std::env::temp_dir().join(format!("sift-cfg-ignl-{}.toml", std::process::id())));
+        app.ignore_dirs = vec!["/home".to_string(), "/etc".to_string()];
+
+        // 打开弹窗：旧值以换行连接（不再用逗号）
+        app.open_popup(PopupKind::IgnoreDirs);
+        assert_eq!(app.popup_input, "/home\n/etc");
+        assert!(!app.popup_input.contains(','), "不应再用逗号分隔");
+
+        // 输入的 \n 转义被解析为换行分隔
+        let tmp = std::env::temp_dir();
+        app.popup_input = format!("{}\\n{}", tmp.display(), tmp.display());
+        app.popup_error = None;
+        app.on_key(enter());
+        assert_eq!(app.popup, None, "\\n 转义应被解析为换行分隔");
+        let canon = std::fs::canonicalize(&tmp)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(app.ignore_dirs, vec![canon], "应去重");
+
+        let _ = std::fs::remove_file(app.config_path.as_ref().unwrap());
+    }
+
+    /// Ctrl+H 切换顶部搜索输入框展开/折叠（默认展开），并重置滚动偏移
+    #[test]
+    fn ctrl_h_toggles_input_expand() {
+        let mut app = App::new();
+        assert!(app.input_expanded, "默认应为展开态");
+        app.input_scroll = 5;
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert!(!app.input_expanded, "Ctrl+H 应折叠");
+        assert_eq!(app.input_scroll, 0, "切换时应重置滚动偏移");
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert!(app.input_expanded, "再按 Ctrl+H 应展开");
+    }
+
+    /// Shift+Enter 在搜索输入框插入真实换行（不触发搜索）
+    #[test]
+    fn shift_enter_inserts_newline_in_search_input() {
+        let mut app = App::new();
+        app.input = "foobar".to_string();
+        app.cursor = 3;
+        let gen = app.search_gen;
+        app.on_key(shift_enter());
+        assert_eq!(app.input, "foo\nbar", "Shift+Enter 应插入换行");
+        assert_eq!(app.cursor, 4);
+        assert_eq!(app.search_gen, gen, "Shift+Enter 不应触发搜索");
+
+        // 普通 Enter 仍触发搜索
+        app.on_key(enter());
+        assert!(app.search_gen > gen);
+    }
+
+    /// Shift+Enter 在忽略目录弹窗插入真实换行（不确认）；路径/大小上限弹窗等同 Enter 确认
+    #[test]
+    fn shift_enter_in_popups() {
+        // 忽略目录：插入换行，弹窗不关
+        let mut app = App::new();
+        app.open_popup(PopupKind::IgnoreDirs);
+        app.popup_select_all = false;
+        app.popup_input = "/home".to_string();
+        app.popup_cursor = 5;
+        app.on_key(shift_enter());
+        assert_eq!(app.popup_input, "/home\n");
+        assert_eq!(app.popup, Some(PopupKind::IgnoreDirs), "不应确认关闭");
+
+        // 大小上限：Shift+Enter 等同 Enter 确认（合法值关闭弹窗）
+        let mut app2 = App::new();
+        app2.config_path =
+            Some(std::env::temp_dir().join(format!("sift-cfg-se-{}.toml", std::process::id())));
+        app2.open_popup(PopupKind::MaxSize);
+        app2.popup_input = "5".to_string();
+        app2.on_key(shift_enter());
+        assert_eq!(app2.popup, None, "大小上限 Shift+Enter 应确认");
+        assert!((app2.max_file_size_mb - 5.0).abs() < 1e-9);
+        let _ = std::fs::remove_file(app2.config_path.as_ref().unwrap());
+    }
+
+    /// 忽略目录弹窗粘贴：保留换行（\r\n 归一化），路径弹窗粘贴仍丢弃换行
+    #[test]
+    fn popup_paste_newline_handling() {
+        let mut app = App::new();
+        app.open_popup(PopupKind::IgnoreDirs);
+        app.popup_select_all = false;
+        app.popup_input.clear();
+        app.popup_cursor = 0;
+        app.on_paste("/a\r\n/b\n/c");
+        assert_eq!(app.popup_input, "/a\n/b\n/c", "忽略目录粘贴应保留换行");
+
+        let mut app2 = App::new();
+        app2.open_popup(PopupKind::Path);
+        app2.popup_select_all = false;
+        app2.popup_input.clear();
+        app2.popup_cursor = 0;
+        app2.on_paste("/a\n/b");
+        assert_eq!(app2.popup_input, "/a/b", "路径粘贴应丢弃换行");
     }
 
     #[test]
@@ -1430,12 +1649,18 @@ mod tests {
 
         // 上限 ~1KB（0.001MB≈1048B）：big_test.sh 被跳过，small_test.sh 保留
         let names = run_filename_search(&root, "test.sh", &[], 0.001);
-        assert!(names.contains(&"small_test.sh".to_string()), "got {names:?}");
+        assert!(
+            names.contains(&"small_test.sh".to_string()),
+            "got {names:?}"
+        );
         assert!(!names.contains(&"big_test.sh".to_string()), "got {names:?}");
 
         // 上限足够大：两者都能搜到
         let names = run_filename_search(&root, "test.sh", &[], 10.0);
-        assert!(names.contains(&"small_test.sh".to_string()), "got {names:?}");
+        assert!(
+            names.contains(&"small_test.sh".to_string()),
+            "got {names:?}"
+        );
         assert!(names.contains(&"big_test.sh".to_string()), "got {names:?}");
 
         let _ = std::fs::remove_dir_all(&root);

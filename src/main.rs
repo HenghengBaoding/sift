@@ -1,6 +1,7 @@
 //! sift — 基于 fd / rg / bat 的终端文件搜索工具（仅 Linux）。
 
 mod app;
+mod clipboard;
 mod config;
 mod editor;
 mod preview;

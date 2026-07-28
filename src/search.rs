@@ -727,7 +727,10 @@ mod tests {
         let size_pos = args.iter().position(|a| a == "--size").expect("--size");
         assert_eq!(args[size_pos + 1], "-1048576b");
         // 忽略目录：--exclude /proc
-        let ex_pos = args.iter().position(|a| a == "--exclude").expect("--exclude");
+        let ex_pos = args
+            .iter()
+            .position(|a| a == "--exclude")
+            .expect("--exclude");
         assert_eq!(args[ex_pos + 1], "/proc");
     }
 
