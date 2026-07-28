@@ -22,6 +22,13 @@ use crate::app::{App, PopupKind, MAX_RESULTS};
 use crate::search::{decode_escapes, sanitize_display, SearchMode, SearchResultItem};
 use crate::theme;
 
+// 面板标题图标（Nerd Font）：图标颜色始终与紧随其后的标题文字一致。
+const ICON_FILE_LIST: &str = "\u{F022}"; // 文件列表（nf-fa-rectangle_list）
+const ICON_FILE_NAME: &str = "\u{F0C7C}"; // 文件名（nf-md-file_outline）
+const ICON_FILE_CONTENT: &str = "\u{F13B8}"; // 文件内容（nf-md-file_document_outline）
+const ICON_PREVIEW: &str = "\u{F0208}"; // 预览（nf-md-eye，待确认）
+const ICON_FULL_PATH: &str = "\u{F0216}"; // 完整路径
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
@@ -108,12 +115,23 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
         ("\u{F48C}", "收起", theme::PEACH)
     };
     let expand_text = format!(" {expand_icon} {expand_word}");
+    // 模式图标（Nerd Font）：文件名 = nf-md-file_outline（U+F0C7C），文件内容 = nf-md-file_document_outline（U+F13B8）
+    // 颜色与各自模式文字一致
+    let mode_icon = match app.mode {
+        SearchMode::FileName => "\u{F0C7C}",
+        SearchMode::Content => "\u{F13B8}",
+    };
+    // 路径图标（Nerd Font）：nf-md-folder_outline（U+F0968），颜色与路径文字一致
+    const PATH_ICON: &str = "\u{F0968}";
     let titles_w = area.width.saturating_sub(2) as usize;
     let fixed_w = UnicodeWidthStr::width(expand_text.as_str())
-        + UnicodeWidthStr::width(" |")
-        + UnicodeWidthStr::width(" 模式: ")
+        + UnicodeWidthStr::width(" ")
+        + UnicodeWidthStr::width(mode_icon)
+        + UnicodeWidthStr::width(" ")
         + UnicodeWidthStr::width(app.mode.label())
-        + UnicodeWidthStr::width(" | 路径: ")
+        + UnicodeWidthStr::width(" ")
+        + UnicodeWidthStr::width(PATH_ICON)
+        + UnicodeWidthStr::width(" ")
         + UnicodeWidthStr::width(" ");
     // 路径按剩余宽度截断，保证不与右侧 chip 重叠
     let path_budget = titles_w.saturating_sub(fixed_w + chip_w + 1).max(4);
@@ -125,13 +143,24 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                 .fg(expand_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" |", theme::title_style()),
-        Span::styled(" 模式: ", theme::title_style()),
+        Span::raw(" "),
+        Span::styled(
+            mode_icon,
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
         Span::styled(
             app.mode.label(),
             Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" | 路径: ", theme::title_style()),
+        Span::raw(" "),
+        Span::styled(
+            PATH_ICON,
+            Style::default()
+                .fg(theme::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
         Span::styled(
             path,
             Style::default()
@@ -299,23 +328,24 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
 /// 过长按宽度截断并以 `...` 替代，保证标题只占一行、不挤压结果列表，且右侧计数始终可见。
 fn list_title_left(app: &App, titles_w: usize, right_w: usize) -> Line<'static> {
     if app.last_query.trim().is_empty() {
-        return theme::t(" 文件列表 ");
+        return theme::t_icon(ICON_FILE_LIST, "文件列表");
     }
-    let mode_color = match app.mode {
-        SearchMode::FileName => theme::SKY,
-        SearchMode::Content => theme::MAUVE,
+    let (mode_color, mode_icon) = match app.mode {
+        SearchMode::FileName => (theme::SKY, ICON_FILE_NAME),
+        SearchMode::Content => (theme::MAUVE, ICON_FILE_CONTENT),
     };
-    let prefix_w = 1 + UnicodeWidthStr::width(app.mode.label()) + 2; // " " + 模式 + ": "
+    let label_style = Style::default().fg(mode_color).add_modifier(Modifier::BOLD);
+    let icon_text = format!(" {mode_icon} ");
+    let prefix_w = UnicodeWidthStr::width(icon_text.as_str())
+        + UnicodeWidthStr::width(app.mode.label())
+        + 2; // 图标+空格 + 模式 + ": "
     let budget = titles_w.saturating_sub(right_w + prefix_w + 1).max(1);
     // 查询可能含真实换行（Shift+Enter）或 `\n` 转义：标题只占一行，
     // 解码后把换行统一展示为 ⏎（与折叠态输入框一致），过长按宽度截断并以 ` ...` 替代（省略号左侧留一个空格）
     let query = truncate_width_with(&decoded_single_line(&app.last_query), budget, " ...");
     Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            app.mode.label(),
-            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(icon_text, label_style),
+        Span::styled(app.mode.label(), label_style),
         Span::styled(": ", theme::title_style()),
         Span::styled(
             query,
@@ -429,7 +459,7 @@ fn item_line(item: &SearchResultItem, selected: bool, width: usize) -> Line<'sta
 }
 
 fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
-    let block = theme::panel(theme::t(" 预览 "));
+    let block = theme::panel(theme::t_icon(ICON_PREVIEW, "预览"));
     let inner = block.inner(area);
     app.preview_width = inner.width.max(1);
 
@@ -473,7 +503,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_path(f: &mut Frame, area: Rect, full_path: &str) {
     let paragraph = Paragraph::new(full_path)
-        .block(theme::panel(theme::t(" 完整路径 ")))
+        .block(theme::panel(theme::t_icon(ICON_FULL_PATH, "完整路径")))
         .style(Style::default().fg(theme::SKY))
         .wrap(Wrap { trim: false });
     f.render_widget(paragraph, area);

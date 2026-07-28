@@ -59,9 +59,12 @@ pub fn popup(title: Line<'static>) -> Block<'static> {
     panel(title).border_style(Style::default().fg(BORDER_POPUP))
 }
 
-/// 普通小标题
-pub fn t(title: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(title.into(), title_style()))
+/// 带前缀图标的小标题：图标 + 空格 + 文字，二者同色（title_style）
+pub fn t_icon(icon: &str, title: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {icon} "), title_style()),
+        Span::styled(format!("{} ", title.into()), title_style()),
+    ])
 }
 
 pub fn title_style() -> Style {
