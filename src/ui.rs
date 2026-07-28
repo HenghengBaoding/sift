@@ -298,7 +298,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
 /// 多行查询先解码转义、再把换行替换为 ⏎（与折叠态输入框一致）单行展示，
 /// 过长按宽度截断并以 `...` 替代，保证标题只占一行、不挤压结果列表，且右侧计数始终可见。
 fn list_title_left(app: &App, titles_w: usize, right_w: usize) -> Line<'static> {
-    if app.last_query.is_empty() {
+    if app.last_query.trim().is_empty() {
         return theme::t(" 文件列表 ");
     }
     let mode_color = match app.mode {
@@ -329,7 +329,7 @@ fn list_title_left(app: &App, titles_w: usize, right_w: usize) -> Line<'static> 
 
 /// 列表右标题：结果计数（搜索中显示动态提示，达到上限显示 400+）
 fn list_title_right(app: &App) -> Option<Line<'static>> {
-    if app.last_query.is_empty() {
+    if app.last_query.trim().is_empty() {
         return None;
     }
     let n = app.results.len();
@@ -1060,6 +1060,20 @@ mod tests {
         let s = render_to_string(&mut app, 100, 30);
         assert!(s.contains("..."), "{s}");
         assert!(!s.contains(&"a".repeat(100)), "{s}");
+    }
+
+    #[test]
+    fn list_title_matches_collapsed_input_trailing_newlines() {
+        // 折叠态输入框与文件列表标题对同一查询的展示必须一致：
+        // 尾部换行（⏎）不能在标题中被丢掉
+        let mut app = App::new();
+        app.mode = SearchMode::Content;
+        app.input = "ceshi \nceshi \n\n".to_string();
+        app.cursor = app.input.chars().count();
+        // dispatch_search 会把原始输入存入 last_query（仅对 fd/rg 传参做 trim）
+        app.last_query = app.input.clone();
+        let s = render_to_string(&mut app, 120, 30);
+        assert!(s.contains("文件内容: ceshi ⏎ceshi ⏎⏎"), "{s}");
     }
 
     /// 文件名含 ESC 等控制字符时，整个界面（列表/路径框）不得把控制字符写进终端

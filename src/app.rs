@@ -221,7 +221,7 @@ impl App {
 
     /// 输入框内容自上次搜索后是否有改动（决定是否显示 "Enter 搜索" 提示）
     pub fn input_dirty(&self) -> bool {
-        self.input.trim() != self.last_query.as_str()
+        self.input.trim() != self.last_query.trim()
     }
 
     /// 展示用路径：家目录前缀缩成 ~
@@ -639,7 +639,7 @@ impl App {
     /// 变更后：清空文件列表缓存（fd 结果依赖这两项设置），若有查询词则立即重搜生效。
     fn research_after_settings_change(&mut self) {
         self.file_lists.clear();
-        if !self.last_query.is_empty() {
+        if !self.last_query.trim().is_empty() {
             self.trigger_search_now();
         }
     }
@@ -744,8 +744,10 @@ impl App {
         // 先停掉可能还在跑的旧搜索（kill 子进程，非阻塞），并令在途消息作废
         self.cancel_current_job();
         self.search_gen += 1;
+        // last_query 保留原始输入（含首尾空白/换行），用于标题展示，与折叠态输入框保持一致；
+        // 实际传给 fd/rg 的查询仍做 trim，避免搜索无意义的首尾空白。
+        self.last_query = self.input.clone();
         let query = self.input.trim().to_string();
-        self.last_query = query.clone();
         if query.is_empty() {
             self.searching = false;
             self.results.clear();
@@ -1142,6 +1144,22 @@ mod tests {
         assert!(app.search_gen > gen, "应派发新搜索");
         assert!(app.searching, "重新搜索后应处于搜索中");
         assert_eq!(app.last_query, "test");
+    }
+
+    /// last_query 保留原始输入的首尾换行（用于标题与折叠态输入框一致），
+    /// 而传给 fd/rg 的查询仍为 trim 后的结果。
+    #[test]
+    fn dispatch_keeps_raw_query_for_display() {
+        let mut app = App::new();
+        app.input = "ceshi \nceshi \n\n".to_string();
+        app.on_key(enter());
+        assert_eq!(app.last_query, "ceshi \nceshi \n\n");
+        // 纯空白输入：trim 后为空，不触发搜索、清空结果
+        let mut app2 = App::new();
+        app2.input = "  \n ".to_string();
+        app2.on_key(enter());
+        assert!(!app2.searching);
+        assert!(app2.results.is_empty());
     }
 
     /// 搜索进行中按 Tab：取消旧搜索、切换模式并重新搜索（不再阻塞等待）
