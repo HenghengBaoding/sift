@@ -107,13 +107,14 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         ("\u{F48C}", "收起", theme::PEACH)
     };
-    let expand_text = format!(" {expand_icon} {expand_word} |");
+    let expand_text = format!(" {expand_icon} {expand_word}");
     let titles_w = area.width.saturating_sub(2) as usize;
     let fixed_w = UnicodeWidthStr::width(expand_text.as_str())
-        + UnicodeWidthStr::width(" 搜索 | 模式: ")
+        + UnicodeWidthStr::width(" |")
+        + UnicodeWidthStr::width(" 模式: ")
         + UnicodeWidthStr::width(app.mode.label())
-        + UnicodeWidthStr::width(" (Tab) | 路径: ")
-        + UnicodeWidthStr::width(" (Ctrl+P) ");
+        + UnicodeWidthStr::width(" | 路径: ")
+        + UnicodeWidthStr::width(" ");
     // 路径按剩余宽度截断，保证不与右侧 chip 重叠
     let path_budget = titles_w.saturating_sub(fixed_w + chip_w + 1).max(4);
     let path = truncate_width(&sanitize_display(&app.current_path_display()), path_budget);
@@ -124,12 +125,12 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                 .fg(expand_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" 搜索 | 模式: ", theme::title_style()),
+        Span::styled(" |", theme::title_style()),
+        Span::styled(" 模式: ", theme::title_style()),
         Span::styled(
             app.mode.label(),
             Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" (Tab)", Style::default().fg(theme::OVERLAY1)),
         Span::styled(" | 路径: ", theme::title_style()),
         Span::styled(
             path,
@@ -137,7 +138,6 @@ fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
                 .fg(theme::YELLOW)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" (Ctrl+P)", Style::default().fg(theme::OVERLAY1)),
         Span::raw(" "),
     ]);
     // 弹窗打开时，焦点在弹窗上，输入框边框降回普通色
@@ -484,16 +484,15 @@ fn footer_items() -> Vec<(&'static str, &'static str)> {
     vec![
         ("Tab", ":切换模式"),
         ("Ctrl+H", ":展开/折叠输入框"),
-        ("Ctrl+P", ":路径"),
+        ("Ctrl+P", ":搜索路径"),
         ("Ctrl+I", ":忽略目录"),
-        ("Ctrl+S", ":大小上限"),
-        ("Alt+J/K", ":选择"),
-        ("↑/↓", ":输入框换行"),
+        ("Ctrl+S", ":文件大小上限"),
+        ("Alt+J/K", ":文件选择"),
         ("Ctrl+J/K", ":滚动预览"),
-        ("Enter", ":搜索"),
-        ("Ctrl+G", ":打开"),
+        ("Ctrl+G", ":打开文件"),
         ("Ctrl+C", ":复制路径"),
         ("Esc", ":取消/退出"),
+        ("Enter", ":搜索"),
     ]
 }
 
