@@ -37,7 +37,7 @@ pub const MAX_RESULTS: usize = 400;
 /// 预览缓存最大条目
 const PREVIEW_CACHE_MAX: usize = 100;
 /// 状态栏消息停留时间
-const STATUS_TTL: Duration = Duration::from_secs(5);
+const STATUS_TTL: Duration = Duration::from_secs(3);
 
 /// on_key 返回的动作（需要主循环配合，如挂起终端打开编辑器）
 pub enum Action {
