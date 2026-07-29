@@ -11,3 +11,10 @@ unicode-width = "0.2"
 anyhow = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.3"
+
+[profile.release]
+opt-level = "z"     # 以体积为优化目标
+lto = "fat"         # 全量链接时优化，跨 crate 内联/裁剪
+codegen-units = 1   # 单代码生成单元，利于体积优化
+panic = "abort"     # 不生成 unwind 表
+strip = true        # 去除符号与调试信息
