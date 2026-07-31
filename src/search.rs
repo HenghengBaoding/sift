@@ -126,16 +126,15 @@ pub fn rg_exclude_globs(root: &Path, extra: &[String]) -> Vec<String> {
     globs
 }
 
-/// fd 排除项：root 之下的忽略目录（'/' 前缀锚定到搜索根）。
-/// fd 默认即跳过隐藏目录与 .git，无需额外排除。
+/// fd 排除项：始终排除 .git（--hidden 会把 .git 纳入搜索），
+/// 再加上 root 之下的忽略目录（'/' 前缀锚定到搜索根）。
 ///
 /// 与内容搜索（rg）一致：用户额外忽略目录（Ctrl+I）同样作用于文件名搜索，
 /// 故 App 调用时 extra 传用户忽略目录。
 pub fn fd_excludes(root: &Path, extra: &[String]) -> Vec<String> {
-    ignore_rels(root, extra)
-        .into_iter()
-        .map(|r| format!("/{r}"))
-        .collect()
+    let mut excludes = vec![".git".to_string()];
+    excludes.extend(ignore_rels(root, extra).into_iter().map(|r| format!("/{r}")));
+    excludes
 }
 
 /// 文件名搜索：返回 (结果, 新构建的文件列表缓存)。
@@ -180,6 +179,7 @@ pub fn fd_cmd(root: &Path, excludes: &[String], max_filesize_bytes: u64) -> Comm
     let mut cmd = Command::new("fd");
     cmd.arg("--type")
         .arg("f")
+        .arg("--hidden")
         .arg("--absolute-path")
         .arg("--color=never")
         .arg("--size")
@@ -711,8 +711,9 @@ mod tests {
         assert!(rels3.contains(&"cache".to_string()), "got {rels3:?}");
         assert!(rels3.contains(&"lib".to_string()), "got {rels3:?}");
 
-        // fd 排除项带 '/' 前缀锚定
+        // fd 排除项：始终含 .git，忽略目录带 '/' 前缀锚定
         let fde = fd_excludes(root, &[]);
+        assert!(fde.contains(&".git".to_string()), "got {fde:?}");
         assert!(fde.contains(&"/proc".to_string()), "got {fde:?}");
     }
 
@@ -723,6 +724,8 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        // --hidden 包含隐藏文件（与 rg 一致）
+        assert!(args.contains(&"--hidden".to_string()), "got {args:?}");
         // 大小上限：--size -<字节>b（与 rg --max-filesize 一致）
         let size_pos = args.iter().position(|a| a == "--size").expect("--size");
         assert_eq!(args[size_pos + 1], "-1048576b");
