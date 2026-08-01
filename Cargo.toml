@@ -11,6 +11,9 @@ unicode-width = "0.2"
 anyhow = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.3"
+image = { version = "0.25", default-features = false, features = ["png","jpeg","gif","bmp","webp"] }
+base64 = "0.22"
+jpeg-decoder = "0.3.2"
 
 [profile.release]
 opt-level = "z"     # 以体积为优化目标

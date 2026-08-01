@@ -48,7 +48,9 @@ cargo run --release
   避免扫描虚拟/庞大目录；用户可通过 `Ctrl+I` 额外添加忽略目录，`Ctrl+S` 调整文件大小上限（fd/rg 同样生效）
 - **路径优先级排序**：命中次数相同时，常用目录（`/home` `/etc` `/usr/local`）结果优先展示
 - **语法高亮预览**：bat 渲染（自动使用 Catppuccin Macchiato 主题，若可用），支持滚动；
-  大文件仅渲染头部 512KB，图片/二进制文件给出提示
+  大文件仅渲染头部 512KB；二进制/高熵乱码文件（如 go sumdb tile）给出「不提供预览」提示
+- **图片预览（kitty 图形协议）**：在 kitty / Alacritty / Ghostty / WezTerm / Konsole / Rio 等支持该协议的终端下
+  直接显示图片（png/jpeg/gif/bmp/webp），先缩放到预览区尺寸再传输，大图也秒开；其它终端回退为文字提示
 - **输入框展开/折叠**：`Ctrl+H` 切换；展开态按宽度自动折行、最高 1/3 屏可滚动；折叠态单行截断
 - **一键打开**：`Ctrl+G` 使用 `$VISUAL` / `$EDITOR` / `nvim` / `vim` / `code` 等，权限不足时自动 `sudo`
 - **复制路径**：`Ctrl+C` 把选中文件完整路径复制到系统剪贴板（wl-copy / xclip / xsel）

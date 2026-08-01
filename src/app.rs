@@ -18,11 +18,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::text::Text;
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::config;
-use crate::preview;
+use crate::preview::{self, Preview};
 use crate::search::{self, SearchMode, SearchResultItem};
 use crate::ui;
 
@@ -36,6 +36,10 @@ const BATCH_INTERVAL: Duration = Duration::from_millis(16);
 pub const MAX_RESULTS: usize = 400;
 /// 预览缓存最大条目
 const PREVIEW_CACHE_MAX: usize = 100;
+/// 预览请求防抖：连按 Alt+J/K 扫过列表时，不每停一下就 spawn 后台线程去解码大图
+/// （否则多个解码线程同时烧 CPU、UI 卡顿）。只记最新请求，静默超过该阈值才真正 spawn。
+/// 缓存命中的预览不走防抖，立即显示，故「切回看过的文件」仍是瞬时。
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
 /// 状态栏消息停留时间
 const STATUS_TTL: Duration = Duration::from_secs(3);
 
@@ -73,7 +77,8 @@ pub enum Msg {
         gen: u64,
         path: PathBuf,
         width: u16,
-        text: Text<'static>,
+        height: u16,
+        preview: Preview,
     },
 }
 
@@ -136,13 +141,20 @@ pub struct App {
     /// 文件列表滚动窗口起点（由绘制层维持）
     pub list_offset: usize,
 
-    pub preview: Option<Rc<Text<'static>>>,
+    pub preview: Option<Rc<Preview>>,
     pub preview_path: Option<PathBuf>,
     pub preview_scroll: u16,
     pub preview_max_scroll: u16,
     pub preview_loading: bool,
     /// 最近一次绘制时预览区内宽（决定 bat 的换行宽度）
     pub preview_width: u16,
+    /// 最近一次绘制时预览区内高（图片预览按宽×高估算缩放目标）
+    pub preview_height: u16,
+    /// 当前图片预览所在的预览区内容区矩形（由绘制层维护，供主循环定位图片）
+    pub image_area: Option<Rect>,
+    /// 当前终端屏幕上正在显示的图片（路径 + 区域），用于主循环对账：
+    /// 避免重复传输同一张图、确保切到文本时清除叠层
+    pub displayed_image: Option<(PathBuf, Rect)>,
     pub size_changed: bool,
 
     pub status: Option<(String, Instant)>,
@@ -164,7 +176,9 @@ pub struct App {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     file_lists: HashMap<PathBuf, (Instant, Arc<Vec<String>>)>,
-    preview_cache: HashMap<(PathBuf, u16), Rc<Text<'static>>>,
+    preview_cache: HashMap<(PathBuf, u16, u16), Rc<Preview>>,
+    /// 防抖中的待预览请求（缓存未命中时延迟 spawn，连按时只保留最新一次）
+    preview_pending: Option<(PathBuf, u16, u16, Instant)>,
     /// 当前搜索任务句柄（用于取消）
     job: Option<SearchJob>,
 }
@@ -197,6 +211,9 @@ impl App {
             preview_max_scroll: 0,
             preview_loading: false,
             preview_width: 80,
+            preview_height: 24,
+            image_area: None,
+            displayed_image: None,
             size_changed: false,
             status: None,
             should_quit: false,
@@ -211,6 +228,7 @@ impl App {
             rx,
             file_lists: HashMap::new(),
             preview_cache: HashMap::new(),
+            preview_pending: None,
             job: None,
         }
     }
@@ -704,18 +722,25 @@ impl App {
                     gen,
                     path,
                     width,
-                    text,
+                    height,
+                    preview,
                 } => {
                     if self.preview_cache.len() >= PREVIEW_CACHE_MAX {
                         self.preview_cache.clear();
                     }
-                    let text = Rc::new(text);
+                    let preview = Rc::new(preview);
                     self.preview_cache
-                        .insert((path.clone(), width), text.clone());
-                    if gen == self.preview_gen && width == self.preview_width {
-                        self.preview = Some(text);
+                        .insert((path.clone(), width, height), preview.clone());
+                    // 只用代号（gen）判定「这份预览是否仍是用户当前想要的」：
+                    // 选中项变化 / 终端 resize 都会调用 request_preview 递增 gen，故 gen 匹配即代表
+                    // 选中项与尺寸意图未变。不再额外比较 width/height——布局可能在「请求」与「渲染完成」
+                    // 之间因路径框折行数变化而微调（如选中长路径文件使预览区矮一行），此时预览内容
+                    // （bat 按宽度折行）依然正确，若因高度差一行就丢弃会造成「首次一直加载中」、
+                    // 切走再切回（缓存命中）才显示的 bug。尺寸真正变化（resize）已由 gen 递增覆盖。
+                    if gen == self.preview_gen {
                         self.preview_path = Some(path);
                         self.preview_loading = false;
+                        self.preview = Some(preview);
                     }
                 }
             }
@@ -723,6 +748,26 @@ impl App {
         if let Some((_, t)) = &self.status {
             if t.elapsed() > STATUS_TTL {
                 self.status = None;
+            }
+        }
+        // 预览防抖：有待处理请求且静默超过阈值，才真正 spawn 后台解码线程。
+        // spawn 时取当前 preview_gen，保证后续消息能通过 gen 对账；连按期间 pending 被不断覆盖，
+        // 故只解码用户最终停留的那张图，避免多个解码线程争抢 CPU。
+        if let Some((_, _, _, t)) = self.preview_pending {
+            if t.elapsed() >= PREVIEW_DEBOUNCE {
+                let (path, width, height, _) = self.preview_pending.take().unwrap();
+                let gen = self.preview_gen;
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let preview = preview::render(&path, width, height);
+                    let _ = tx.send(Msg::PreviewDone {
+                        gen,
+                        path,
+                        width,
+                        height,
+                        preview,
+                    });
+                });
             }
         }
     }
@@ -872,30 +917,25 @@ impl App {
             self.preview = None;
             self.preview_path = None;
             self.preview_loading = false;
+            self.preview_pending = None;
             return;
         };
         let path = item.path.clone();
         let width = self.preview_width.max(10);
-        if let Some(t) = self.preview_cache.get(&(path.clone(), width)) {
-            self.preview = Some(t.clone());
+        let height = self.preview_height.max(1);
+        if let Some(p) = self.preview_cache.get(&(path.clone(), width, height)) {
+            // 缓存命中：立即显示，并取消任何防抖中的旧请求（避免无谓解码/错位）
+            self.preview_pending = None;
             self.preview_path = Some(path);
             self.preview_loading = false;
+            self.preview = Some(p.clone());
             return;
         }
+        // 缓存未命中：不立即 spawn，记入防抖队列，等 tick 静默超过阈值再解码
         self.preview = None;
         self.preview_loading = true;
         self.preview_path = Some(path.clone());
-        let gen = self.preview_gen;
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let text = preview::render(&path, width);
-            let _ = tx.send(Msg::PreviewDone {
-                gen,
-                path,
-                width,
-                text,
-            });
-        });
+        self.preview_pending = Some((path, width, height, Instant::now()));
     }
 }
 
@@ -1106,6 +1146,7 @@ fn expand_tilde(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::text::Text;
 
     fn item(path: &str, display: &str, score: i64) -> SearchResultItem {
         SearchResultItem {
@@ -1227,7 +1268,7 @@ mod tests {
         // 第一批：只有 usr/share/test.sh，被选中且预览已展示其内容
         app.results = vec![item("/usr/share/test.sh", "usr/share/test.sh", 1)];
         app.list_state.select(Some(0));
-        app.preview = Some(Rc::new(Text::from("old content")));
+        app.preview = Some(Rc::new(Preview::Text(Text::from("old content"))));
         app.preview_path = Some(PathBuf::from("/usr/share/test.sh"));
 
         // 第二批：分数更高的 home/heng/test.sh 到达，重排后成为新的第 0 项
@@ -1260,7 +1301,7 @@ mod tests {
         app.searching = true;
         app.results = vec![item("/home/heng/test.sh", "home/heng/test.sh", 10)];
         app.list_state.select(Some(0));
-        app.preview = Some(Rc::new(Text::from("current content")));
+        app.preview = Some(Rc::new(Preview::Text(Text::from("current content"))));
         app.preview_path = Some(PathBuf::from("/home/heng/test.sh"));
 
         let gen = app.search_gen;
@@ -1275,6 +1316,92 @@ mod tests {
         // 第 0 项未变，预览原样保留
         assert!(app.preview.is_some());
         assert!(!app.preview_loading);
+    }
+
+    /// 预览防抖：连按 Alt+J/K 扫过列表时，缓存未命中的请求只保留最后一次（合并 spawn），
+    /// 避免多个后台解码线程同时争抢 CPU。缓存命中不走防抖（此处均为不存在路径→未命中）。
+    #[test]
+    fn preview_debounce_coalesces_rapid_moves() {
+        let mut app = App::new();
+        app.results = vec![
+            item("/no/such/a.png", "a.png", 1),
+            item("/no/such/b.png", "b.png", 1),
+            item("/no/such/c.png", "c.png", 1),
+        ];
+        app.list_state.select(Some(0));
+        app.request_preview(); // 未命中 -> pending=a（不立即 spawn）
+        assert!(app.preview_pending.is_some(), "未命中应记入防抖队列");
+        assert!(app.preview.is_none(), "防抖期间不应有预览内容");
+        assert!(app.preview_loading);
+
+        app.list_state.select(Some(1));
+        app.request_preview(); // 覆盖 pending=b
+        app.list_state.select(Some(2));
+        app.request_preview(); // 覆盖 pending=c
+
+        let (path, _, _, _) = app.preview_pending.as_ref().unwrap();
+        assert_eq!(
+            path,
+            &PathBuf::from("/no/such/c.png"),
+            "连按应只保留最后一次请求"
+        );
+    }
+
+    /// 缓存命中的预览应取消防抖中的旧请求，避免无谓解码/错位。
+    #[test]
+    fn preview_cache_hit_cancels_pending() {
+        let mut app = App::new();
+        app.preview_width = 80;
+        app.preview_height = 24;
+        let path = PathBuf::from("/cached/x.txt");
+        app.preview_cache.insert(
+            (path.clone(), 80, 24),
+            Rc::new(Preview::Text(Text::from("cached"))),
+        );
+        app.results = vec![item("/cached/x.txt", "x.txt", 1)];
+        app.list_state.select(Some(0));
+        // 先制造一个 pending（模拟上一次未命中）
+        app.preview_pending = Some((PathBuf::from("/other.png"), 80, 24, Instant::now()));
+
+        app.request_preview(); // 命中缓存 -> 立即显示 + 清 pending
+
+        assert!(app.preview_pending.is_none(), "缓存命中应取消防抖队列");
+        assert!(app.preview.is_some(), "缓存命中应立即显示");
+        assert!(!app.preview_loading);
+    }
+
+    /// 回归：预览在「请求」与「渲染完成」之间布局可能因路径框折行数变化而微调（如选中长路径文件
+    /// 使预览区矮一行）。此时渲染完成的预览携带的是请求时的旧尺寸，若因高度与当前不一致就丢弃，
+    /// 会造成「首次一直加载中」、切走再切回（缓存命中）才显示的 bug。只要 gen 匹配（选中项/尺寸意图
+    /// 未变）就应显示，不与当前 width/height 逐值比较。
+    #[test]
+    fn preview_done_shows_even_if_layout_height_reflowed() {
+        let mut app = App::new();
+        app.preview_width = 122;
+        app.preview_height = 39; // 请求时的预览区高度（选中前的上一帧）
+        app.results = vec![item("/some/very/long/path/file.bin", "file.bin", 1)];
+        app.list_state.select(Some(0));
+        app.request_preview(); // gen 递增，缓存未命中 -> pending（携带 h=39）
+        let gen = app.preview_gen;
+        assert!(app.preview_loading);
+
+        // 模拟下一帧绘制：选中长路径文件使路径框多折一行，预览区矮一行
+        app.preview_height = 38;
+
+        // 后台渲染完成，携带请求时的旧尺寸 h=39，但 gen 仍是当前选中项
+        app.tx
+            .send(Msg::PreviewDone {
+                gen,
+                path: PathBuf::from("/some/very/long/path/file.bin"),
+                width: 122,
+                height: 39, // 与当前 preview_height(38) 不一致
+                preview: Preview::Text(Text::from("（二进制文件，不提供预览）")),
+            })
+            .unwrap();
+        app.tick();
+
+        assert!(app.preview.is_some(), "gen 匹配即应显示，不因高度重排而丢弃");
+        assert!(!app.preview_loading, "不应卡在加载中");
     }
 
     /// 取消搜索会递增 gen，使在途的旧批次消息作废，不会把已取消的结果又塞回列表

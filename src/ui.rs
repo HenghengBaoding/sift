@@ -19,6 +19,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, PopupKind, MAX_RESULTS};
+use crate::preview::Preview;
 use crate::search::{decode_escapes, sanitize_display, SearchMode, SearchResultItem};
 use crate::theme;
 
@@ -462,6 +463,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
     let block = theme::panel(theme::t_icon(ICON_PREVIEW, "预览"));
     let inner = block.inner(area);
     app.preview_width = inner.width.max(1);
+    app.preview_height = inner.height.max(1);
 
     // 防御：预览内容必须与当前选中项一致。流式搜索结果重排序可能换掉选中项，
     // 若出现错位则丢弃旧预览并重新请求，避免“路径已变、内容未变”
@@ -471,32 +473,46 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
         app.request_preview();
     }
 
-    if let Some(text) = &app.preview {
-        let total = text.lines.len();
-        let max_scroll = total.saturating_sub(inner.height as usize) as u16;
-        app.preview_max_scroll = max_scroll;
-        if app.preview_scroll > max_scroll {
-            app.preview_scroll = max_scroll;
+    match app.preview.as_deref() {
+        Some(Preview::Text(text)) => {
+            app.image_area = None;
+            let total = text.lines.len();
+            let max_scroll = total.saturating_sub(inner.height as usize) as u16;
+            app.preview_max_scroll = max_scroll;
+            if app.preview_scroll > max_scroll {
+                app.preview_scroll = max_scroll;
+            }
+            let paragraph = Paragraph::new(text.clone())
+                .block(block)
+                .scroll((app.preview_scroll, 0));
+            f.render_widget(paragraph, area);
         }
-        let paragraph = Paragraph::new((**text).clone())
-            .block(block)
-            .scroll((app.preview_scroll, 0));
-        f.render_widget(paragraph, area);
-    } else {
-        f.render_widget(block, area);
-        if inner.height > 0 && inner.width > 0 {
-            let lines = if app.preview_loading {
-                loading_lines("加载中", inner.height)
-            } else if app.selected_item().is_some() {
-                placeholder_lines("无法预览该文件", inner.height)
-            } else if app.searching {
-                loading_lines("搜索中", inner.height)
-            } else if !app.last_query.is_empty() {
-                placeholder_lines("无匹配结果", inner.height)
-            } else {
-                placeholder_lines("暂无预览", inner.height)
-            };
-            f.render_widget(Paragraph::new(lines), inner);
+        Some(Preview::Image { .. }) => {
+            // 光标定位模式：图片由主循环在绘制后以光标定位写入终端（z=-1 置于文本之后）。
+            // 这里只绘制边框，并把内容区清成「无背景色的空格」，让图片从其后透出；不滚动。
+            app.preview_max_scroll = 0;
+            app.preview_scroll = 0;
+            f.render_widget(block, area);
+            f.render_widget(Clear, inner);
+            app.image_area = Some(inner);
+        }
+        None => {
+            app.image_area = None;
+            f.render_widget(block, area);
+            if inner.height > 0 && inner.width > 0 {
+                let lines = if app.preview_loading {
+                    loading_lines("加载中", inner.height)
+                } else if app.selected_item().is_some() {
+                    placeholder_lines("无法预览该文件", inner.height)
+                } else if app.searching {
+                    loading_lines("搜索中", inner.height)
+                } else if !app.last_query.is_empty() {
+                    placeholder_lines("无匹配结果", inner.height)
+                } else {
+                    placeholder_lines("暂无预览", inner.height)
+                };
+                f.render_widget(Paragraph::new(lines), inner);
+            }
         }
     }
 }

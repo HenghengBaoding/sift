@@ -4,6 +4,7 @@ mod app;
 mod clipboard;
 mod config;
 mod editor;
+mod image_preview;
 mod preview;
 mod search;
 mod theme;
@@ -63,8 +64,40 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    use std::io::Write;
+    let mut stdout = io::stdout();
     while !app.should_quit {
         terminal.draw(|f| ui::draw(f, app))?;
+
+        // 图片叠层对账：让终端屏幕上实际显示的图片与「当前期望预览」严格一致。
+        // 只比对「屏幕上有什么」(displayed_image) 与「现在该有什么」(want_image)，与预览历史无关，
+        // 故切到文本/空预览时一定能删掉旧图（修复「预览图片后不清除」），
+        // 且同一张图同一区域不重复传输 MB 级数据（性能关键）。
+        let want_image: Option<(std::path::PathBuf, ratatui::layout::Rect)> =
+            match app.preview.as_deref() {
+                Some(crate::preview::Preview::Image { .. }) => {
+                    app.preview_path.clone().zip(app.image_area)
+                }
+                _ => None,
+            };
+        match (&app.displayed_image, &want_image) {
+            (Some(disp), Some(want)) if disp == want => {} // 未变：跳过，不重传
+            (_, Some(want)) => {
+                if let Some(crate::preview::Preview::Image { transmit }) = app.preview.as_deref() {
+                    let seq = image_preview::show_sequence(want.1, transmit);
+                    let _ = stdout.write_all(&seq);
+                    let _ = stdout.flush();
+                    app.displayed_image = Some(want.clone());
+                }
+            }
+            (Some(_), None) => {
+                // 期望无图（文本/空/加载中）但屏幕上还有图：删除叠层
+                let _ = stdout.write_all(&image_preview::delete_all_payload());
+                let _ = stdout.flush();
+                app.displayed_image = None;
+            }
+            (None, None) => {}
+        }
 
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
